@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# register-wakeup — agents call this to schedule a future wake.
+#
+# The daemon polls wakeup_queue and fires each due row, spawning the named
+# agent with the given prompt.
+#
+# Usage:
+#   register-wakeup --agent <slug> --at "<YYYY-MM-DD HH:MM:SS>" --prompt "<text>"
+#                   [--task <task-slug>] [--condition time|event|check]
+#
+# Notes:
+#   - Times are interpreted in the daemon host's local TZ unless ISO-8601 with offset.
+#   - `--condition check` means "fire at fire_at, but the wakeup prompt should
+#     re-poll something and re-register if not done." (Daemon honors this hint.)
+#   - Lists pending wakes:  register-wakeup --list
+
+set -euo pipefail
+
+DB="${TPMEM_DB:-$HOME/.tpmem/kb.db}"
+
+AGENT=""
+FIRE_AT=""
+PROMPT=""
+TASK=""
+COND="time"
+LIST=0
+
+usage() {
+  cat <<EOF
+register-wakeup — schedule a future agent wake (queued in tpmem.wakeup_queue)
+
+Usage:
+  register-wakeup --agent <slug> --at "<YYYY-MM-DD HH:MM:SS>" --prompt "<text>" \\
+                  [--task <task-slug>] [--condition time|event|check]
+  register-wakeup --list              # show pending wakeups
+
+Examples:
+  register-wakeup --agent dev-task --at "2026-04-25 21:00:00" \\
+                  --prompt "check status of build X, continue if done" \\
+                  --task task-2026-04-25-build-x
+
+  register-wakeup --list
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --agent)     AGENT="$2"; shift 2 ;;
+    --at)        FIRE_AT="$2"; shift 2 ;;
+    --prompt)    PROMPT="$2"; shift 2 ;;
+    --task)      TASK="$2"; shift 2 ;;
+    --condition) COND="$2"; shift 2 ;;
+    --list)      LIST=1; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [ "$LIST" -eq 1 ]; then
+  sqlite3 -header -column "$DB" \
+    "SELECT id, agent_slug, fire_at, condition_type, task_slug, substr(prompt,1,60) AS prompt
+     FROM wakeup_queue
+     WHERE fired_at IS NULL
+     ORDER BY fire_at ASC;"
+  exit 0
+fi
+
+if [ -z "$AGENT" ] || [ -z "$FIRE_AT" ] || [ -z "$PROMPT" ]; then
+  usage >&2
+  exit 1
+fi
+
+esc() { printf '%s' "$1" | sed "s/'/''/g"; }
+
+if [ -n "$TASK" ]; then
+  TASK_SQL="'$(esc "$TASK")'"
+else
+  TASK_SQL="NULL"
+fi
+
+# Single-connection insert + return id. last_insert_rowid() in a separate
+# sqlite3 invocation runs in a new connection and would always return 0.
+WAKE_ID=$(sqlite3 "$DB" "INSERT INTO wakeup_queue
+  (agent_slug, fire_at, prompt, condition_type, task_slug)
+  VALUES ('$(esc "$AGENT")', '$(esc "$FIRE_AT")', '$(esc "$PROMPT")', '$(esc "$COND")', $TASK_SQL);
+SELECT last_insert_rowid();")
+
+echo "registered wakeup id=$WAKE_ID  agent=$AGENT  fire_at=$FIRE_AT  task=${TASK:--}"

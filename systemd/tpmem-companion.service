@@ -1,0 +1,24 @@
+[Unit]
+Description=tpmem-companion — persistent Claude Code companion session in tmux
+After=network-online.target tpmem-daemon.service
+Wants=network-online.target tpmem-daemon.service
+# The companion is more useful when the daemon is up (it delivers the companion's
+# outbox replies), but it can run without it — Wants=, not Requires=.
+
+[Service]
+# `tmux new-session -d` exits immediately (it daemonizes the session), so
+# oneshot + RemainAfterExit lets systemd track us as "active" without owning
+# the tmux process tree.
+Type=oneshot
+RemainAfterExit=yes
+
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Adjust the path if you cloned the repo elsewhere
+ExecStart=%h/tpmem-companion-engine/tools/start-companion bg
+ExecStop=%h/tpmem-companion-engine/tools/start-companion stop
+
+RestartSec=15
+
+[Install]
+WantedBy=default.target

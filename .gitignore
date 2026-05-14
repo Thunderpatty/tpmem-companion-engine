@@ -1,0 +1,20 @@
+# Secrets — NEVER commit
+secrets.env
+*.env
+!*.env.example
+
+# Runtime artifacts
+*.log
+*.touch
+healthcheck.touch
+__pycache__/
+*.py[cod]
+
+# Local DB
+*.db
+*.sqlite
+*.sqlite3
+
+# OS / editor
+.DS_Store
+*.swp

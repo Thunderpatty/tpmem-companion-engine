@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# start-companion — launch the persistent companion Claude Code session in tmux.
+#
+# Creates (or reattaches to) a detached tmux session named 'companion' running
+# a long-lived interactive `claude` session, bootstrapped to load the companion
+# skill and enter its tick loop.
+#
+# Usage:
+#   start-companion         create or reattach (interactive — drops you in)
+#   start-companion bg      create in background, don't attach
+#   start-companion stop    kill the session
+#   start-companion status  show whether the session is alive
+#
+# Optional env var:
+#   TPMEM_OWNER_CHAT_ID   Telegram chat id the companion sends its "back online"
+#                         nudge to on startup. If unset, the companion just
+#                         skips the proactive nudge.
+
+set -euo pipefail
+SESSION="companion"
+SKILL_PATH="${TPMEM_SKILL_PATH:-$HOME/.claude/skills/companion/SKILL.md}"
+OWNER="${TPMEM_OWNER_CHAT_ID:-}"
+
+case "${1:-attach}" in
+  stop)
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+      tmux kill-session -t "$SESSION"
+      echo "companion: session killed"
+    else
+      echo "companion: no session running"
+    fi
+    exit 0
+    ;;
+
+  status)
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+      echo "companion: session ALIVE"
+      tmux list-windows -t "$SESSION"
+    else
+      echo "companion: NOT running"
+      exit 1
+    fi
+    exit 0
+    ;;
+
+  attach|bg)
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+      echo "companion: session already running"
+    else
+      echo "companion: starting new tmux session"
+      # The bootstrap is passed as a positional prompt arg — claude treats it as
+      # the FIRST user message in the interactive session.
+      if [ -n "$OWNER" ]; then
+        NUDGE="Send a brief \"back online\" nudge to chat id ${OWNER} via companion-respond --transport telegram --reply-to ${OWNER} before sleeping the first tick."
+      else
+        NUDGE="(No TPMEM_OWNER_CHAT_ID set — skip the proactive back-online nudge.)"
+      fi
+      BOOTSTRAP="You are running as the companion agent. Load the companion skill at ${SKILL_PATH} and follow it. First: run the recovery queries (PRIORITY: check for the latest companion:session-wrap:* note in the last 6 hours — that is a graceful handoff from a previous instance of yourself), then read any pending companion-routed inbox rows and respond to each. Then enter the tick loop. ${NUDGE}"
+      tmux new-session -d -s "$SESSION" \
+        claude --add-dir "$HOME" --permission-mode bypassPermissions "$BOOTSTRAP"
+      echo "companion: launched (bootstrap is the first user message)"
+    fi
+    if [ "${1:-attach}" = "attach" ]; then
+      exec tmux attach -t "$SESSION"
+    else
+      echo "running in background. Attach later with:  tmux attach -t $SESSION"
+    fi
+    ;;
+
+  *) echo "usage: $(basename "$0") [attach|bg|stop|status]" >&2; exit 2 ;;
+esac
