@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AGENT//OS — control deck</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,400;0,500;1,400&family=Instrument+Serif:ital@0;1&family=Sora:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+
+<!-- ─────────────── LOGIN GATE ─────────────── -->
+<div id="gate" class="gate">
+  <div class="gate-grain"></div>
+  <div class="gate-card">
+    <div class="gate-mark">
+      <span class="mk-glyph">◈</span>
+      <div class="mk-text">
+        <span class="mk-line1">AGENT</span><span class="mk-slash">//</span><span class="mk-line2">OS</span>
+        <span class="mk-sub">multi-agent control deck</span>
+      </div>
+    </div>
+    <p class="gate-blurb">Authenticate to the gateway bus. Paste your bearer token to bring the fleet online.</p>
+    <form id="gate-form" autocomplete="off">
+      <label class="field">
+        <span class="field-label">BEARER TOKEN</span>
+        <input id="gate-token" type="password" spellcheck="false" placeholder="••••••••••••••••••••••••" />
+      </label>
+      <label class="remember">
+        <input type="checkbox" id="gate-remember" checked />
+        <span>keep me signed in on this device</span>
+      </label>
+      <button id="gate-submit" type="submit">
+        <span class="gs-label">ESTABLISH LINK</span>
+        <span class="gs-spin" aria-hidden="true"></span>
+      </button>
+      <div id="gate-error" class="gate-error" role="alert"></div>
+    </form>
+    <div class="gate-foot">
+      <span class="dot-idle"></span> gateway · <span id="gate-host"></span>
+    </div>
+  </div>
+</div>
+
+<!-- ─────────────── CONSOLE ─────────────── -->
+<div id="app" class="app" hidden>
+  <!-- left rail: agent tabs -->
+  <aside class="rail">
+    <div class="rail-head">
+      <span class="rail-glyph">◈</span>
+      <div class="rail-title">AGENT<span>//</span>OS</div>
+    </div>
+    <nav id="tabs" class="tabs"></nav>
+    <div class="rail-foot">
+      <div id="link-state" class="link-state"><span class="ls-dot"></span><span class="ls-text">linking…</span></div>
+      <button id="logout" class="logout" title="Clear token and sign out">SIGN OUT</button>
+    </div>
+  </aside>
+
+  <!-- main conversation column -->
+  <main class="stage">
+    <header class="conv-head">
+      <div class="ch-id">
+        <span id="conv-accent" class="ch-accent"></span>
+        <div class="ch-meta">
+          <h1 id="conv-name">—</h1>
+          <div id="conv-status" class="ch-status">idle</div>
+        </div>
+      </div>
+      <div class="ch-tags">
+        <span id="conv-channel" class="ch-tag">#—</span>
+        <span id="conv-managed" class="ch-tag muted" hidden>dispatcher</span>
+        <span id="conv-paused" class="ch-tag warn" hidden>paused</span>
+      </div>
+    </header>
+
+    <section id="thread" class="thread" aria-live="polite">
+      <div class="empty-state" id="empty-state">
+        <span class="es-glyph">◈</span>
+        <p>select an agent to open the channel</p>
+      </div>
+    </section>
+
+    <footer class="composer">
+      <div id="busy-banner" class="busy-banner" hidden>
+        <span class="bb-dots"><i></i><i></i><i></i></span>
+        <span id="bb-name">agent</span> is thinking…
+      </div>
+      <div id="attach-tray" class="attach-tray" hidden></div>
+      <form id="send-form" class="send-row">
+        <select id="prio" class="prio" title="message priority">
+          <option value="normal">normal</option>
+          <option value="critical">critical</option>
+        </select>
+        <input type="file" id="file" multiple hidden />
+        <button id="attach" type="button" class="attach-btn" title="attach file">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M21 11.5 12.5 20a5 5 0 0 1-7-7l8-8a3.3 3.3 0 0 1 4.7 4.7l-8 8a1.6 1.6 0 0 1-2.3-2.3l7.3-7.3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <textarea id="body" class="body-input" rows="1" placeholder="message the agent…  ↵ to send · ⇧↵ for newline"></textarea>
+        <button id="send" type="submit" class="send-btn" title="send (Enter)">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M3 11.5 21 3l-8.5 18-2.4-7.1z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+        </button>
+      </form>
+    </footer>
+  </main>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

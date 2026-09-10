@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# spawn-default-agents — bring up the two default persistent agents (companion + curator).
+#
+# Idempotent: spawn-agent refuses to relaunch a session that already exists, so this is
+# safe to run on every boot (it's what the companion-agents.service oneshot calls).
+#
+# Extra agents you create later are respawned automatically by the dispatcher when they
+# have pending work; this helper just guarantees the two defaults are always up.
+set -euo pipefail
+ENGINE_DIR="${COMPANION_ENGINE_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+BIN="$ENGINE_DIR/bin"
+
+for slug in companion curator; do
+  "$BIN/spawn-agent" "$slug" || echo "spawn-default-agents: '$slug' spawn returned nonzero (may already be running)"
+done

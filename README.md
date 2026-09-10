@@ -1,248 +1,233 @@
 # tpmem-companion-engine
 
-An async **transport + orchestration layer for Claude Code agents**.
-
-It lets you talk to Claude Code from Telegram (or email) and have it respond two
-different ways:
-
-1. **Fresh-spawn agents** — a slash-command message spins up a one-shot `claude -p`
-   for a named agent, with a knowledge-base–loaded preamble so it knows where it
-   left off. Good for discrete jobs (a report, an audit, a scheduled task).
-2. **The companion** — everything else routes to one **long-lived** Claude Code
-   session that stays running in tmux. It polls an inbox table, answers in a single
-   continuous thread (full conversational continuity, no cold start), and queues its
-   replies for delivery. This is the "always-on assistant" shape.
-
-Both share one SQLite knowledge base (the "KB", or *tpmem*) for memory that survives
-process restarts.
-
----
-
-## Architecture
+A runtime for **persistent Claude Code agents**. Instead of spawning a fresh
+`claude -p` per message, it keeps long-lived Claude Code sessions running in tmux and
+wakes them — with full conversational continuity — only when there is work to do. It
+ships with a packaged web chat deck as the default interface, a small SQLite memory
+substrate (**tpmem**), and two agents out of the box: a **companion** you talk to and a
+**curator** that maintains memory.
 
 ```
-   Telegram / Email                      SQLite KB (~/.tpmem/kb.db)
-        │                          ┌──────────────────────────────────┐
-        │  poll                    │  inbox   outbox   wakeup_queue    │
-        ▼                          │  entities   notes                │
-  ┌───────────┐   write     ┌──────┴──────┐                           │
-  │ tpmem-    │────────────▶│   inbox     │                           │
-  │ daemon    │             └──────┬──────┘                           │
-  │           │   route by regex   │                                  │
-  │  (main.py)│◀───────────────────┘                                  │
-  │           │                                                       │
-  │           │   agent == "companion"    ──▶ just tag the row;        │
-  │           │                               leave it pending        │
-  │           │                                      │                │
-  │           │   else  ──▶ spawn `claude -p`         │                │
-  │           │             with KB preamble         │                │
-  └─────┬─────┘                                      │                │
-        │                                            ▼                │
-        │                               ┌────────────────────────┐    │
-        │   read & deliver               │  companion session     │    │
-        │◀───────────────  outbox  ◀─────│  (persistent, in tmux) │    │
-        │                                │  polls inbox, replies  │    │
-        ▼                                │  via companion-respond │    │
-   Telegram / Email                      └────────────────────────┘    │
-                                                                       │
-   wakeup_queue: any agent can self-schedule a future run ──────────────┘
+        you ── paste the token once ──┐
+                                      ▼
+  ┌──────────────┐   HTTP / WS    ┌──────────────────────────┐       (optional, OFF by default)
+  │  browser     │◀──────────────▶│  gateway  :7364          │◀──┐  ┌──────────────────┐  telegram
+  │  webapp deck │   chat/attach  │  token-gated chat + API  │   └──│ transport bridge │◀─  /
+  └──────────────┘                └─────┬──────────────▲─────┘      │   (I/O only)     │   email
+                                   /send│ write        │ /messages,/ws └──────────────────┘
+                                        ▼              │ read
+  ┌─────────────────────────────────────────────────────┴─────────────────────┐
+  │                     SQLite bus   ·   ~/.tpmem/kb.db                          │
+  │     messages     inbox     outbox     read_state                            │
+  │   ───────────────────  memory substrate (tpmem)  ───────────────────────    │
+  │     entities · notes (KB)        MEMORY.md · PERSISTENT.md · FLAGS.md        │
+  └────▲──────────────────┬────────────────────────────────▲────────────────────┘
+       │ drop 1 inbox row │ watch inbox                     │ outbox + KB notes
+       │                  ▼                                 │
+  daily curator     ┌───────────────┐                       │
+  wake: cron →      │  dispatcher    │  ← the only cron in   │
+  queue-job         │ (state-aware)  │    the whole system   │
+  (via daemon)      └───────┬───────┘                       │
+        inject "tick" when  │  respawn a fresh session       │
+        agent idle + work   │  if it died with work pending  │
+                            ▼                                 │
+  ┌─────────────────────────────────────────────────────────┴─────────┐
+  │              persistent agents   ·   long-lived tmux `claude`        │
+  │     ┌───────────┐    ┌───────────┐    ┌ ─ ─ ─ ─ ─ ┐                  │
+  │     │ companion │    │  curator  │    │  grow…    │  (self-expansion)│
+  │     └─────┬─────┘    └─────┬─────┘    └ ─ ─ ─ ─ ─ ┘                  │
+  │           └──── handle tick → reply via companion-respond → outbox ──┘
+  └───────────┬────────────────────────────────────────────────────────┘
+              │
+   context-monitor watches each agent's token use
+              │   nears ≈840k (Claude — headroom for the wrap note;
+              ▼   lower it for smaller-context models, e.g. < 300k)
+  ┌────────────────────── continuity · the wrap system ────────────────────┐
+  │  1. agent-wrap    → write NEXT.md + a KB wrap note (readback-verified,  │
+  │                     so the handoff can never be silently lost)         │
+  │  2. rotate-agent  → the dispatcher respawns a fresh session            │
+  │  3. successor boots → primes from NEXT.md → carries on mid-stride.     │
+  │                     Continuity is preserved, never reset.              │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Flow:**
-1. The daemon long-polls Telegram (and optionally IMAP email) and writes each
-   allowlisted message to the `inbox` table.
-2. Its worker loop matches each `inbox` row against `routing` regexes in `config.yaml`.
-3. If the matched agent is `companion`, the daemon just sets `routed_agent='companion'`
-   and leaves the row `pending` — the companion session owns its own response.
-4. Otherwise the daemon spawns `claude -p` for that agent (loading
-   `~/.claude/skills/<agent>/SKILL.md` plus a preamble of recent KB state), sends an
-   immediate "working on it…" ack, then delivers the agent's output.
-5. The companion session polls for its rows, replies via the `companion-respond`
-   helper (which writes to `outbox`), and the daemon delivers the `outbox` rows.
-6. Separately, the daemon drains `wakeup_queue` — rows any agent scheduled with
-   `register-wakeup` to wake itself (or another agent) at a future time.
+## The model
 
-Every spawn and wakeup is logged as an `audit` note in the KB against the
-`daemon-relay` entity.
+- **Persistent, not per-message.** Each agent is one long-lived `claude` session in a
+  tmux window. It boots from a seed, orients from memory, then sits idle. Its
+  continuity *is* that session — earlier-today context, tasks in flight, the running
+  thread — with the SQLite KB underneath for crash recovery.
 
----
+- **The dispatcher decides *when* to wake it.** `daemon/dispatcherd.py` watches the
+  `inbox` table. When an agent has pending rows and is idle, it injects a single
+  batched *tick* into the agent's tmux session (`agent-msg inbox` → handle → reply →
+  stop). Agents never poll an empty queue, and a burst of messages coalesces into one
+  wake instead of piling up mid-turn. Busy/idle is read from the agent's transcript
+  tail (ground truth), so it never injects mid-turn. If a session has died with work
+  waiting, the dispatcher respawns it from the registry.
+
+- **No `claude -p`, anywhere.** Scheduled work (like the curator's daily pass) is a
+  cron job that calls `queue-job`, which drops an inbox row — so it runs inside the
+  agent's *running* context, not a cold one-shot. For isolated throwaway work an agent
+  uses a Task subagent.
+
+## Continuity — the wrap system
+
+Continuity is the whole point of this architecture, and a single `claude` session can't
+run forever — it fills its context window. The **wrap system** is how an agent hands off
+to its own successor without losing the thread:
+
+- **`context-monitor`** watches each agent's token usage. As it nears the limit —
+  **≈840k tokens for Claude models**, which deliberately leaves headroom to author the
+  handoff — it signals the agent to rotate.
+- **`agent-wrap`** has the agent author a **`NEXT.md`** handoff (what it was doing,
+  what's next, what can't be rederived) plus a KB wrap note. The write is
+  **readback-verified**, so a handoff can never be silently lost to a crash.
+- **`rotate-agent`** then has the dispatcher respawn a fresh session, which **primes
+  from `NEXT.md`** on boot and carries on mid-stride.
+
+The result is an agent that stays "alive" for weeks — rotating through many underlying
+sessions — with continuity intact, and the KB underneath for crash recovery in between.
+This is the backbone of the system; nothing else here matters if the agents can't
+remember who they are across sessions.
+
+> **Using a smaller-context model?** The 840k default assumes a large (~1M-token) Claude
+> context. If your model's window is smaller (say a ChatGPT-class model under ~300k),
+> lower each agent's `rotate_threshold` in the registry proportionally — leave enough
+> headroom that the agent can still write a full wrap note *after* the trigger fires.
+
+## The two default agents
+
+| Agent | Role |
+|---|---|
+| **companion** | Your primary interface. One continuous conversation that helps you think, learn, and build, with full context of everything before. |
+| **curator** | Maintains the memory layer. A daily `queue-job` wakes it to run the `curate-memory` skill: mine conversation deltas for context the sessions didn't record, and persist it additively to memory + the KB. |
+
+Two is the default on purpose. When a recurring, specialised job outgrows the
+companion thread, you spin up a dedicated agent — see
+[`docs/SELF_EXPANSION.md`](docs/SELF_EXPANSION.md).
+
+## The webapp + the token key
+
+The default interface is a packaged single-page chat deck served by the gateway on
+port **7364** (`gateway/public/`). It has a left rail of per-agent tabs with live
+busy/idle + pending-count indicators, a message thread per channel over WebSocket, and
+file/image attach (uploads land where agents read `[attachment: <path>]`).
+
+**Access is gated by a single bearer token — the "key".** On first launch the gateway
+reads it from `~/.tpmem/agent-os/gateway.token` (generated by `install.sh`), or from
+the `GATEWAY_TOKEN` env var. The webapp shows a login gate; you paste the key once and
+it's remembered in a cookie. Every HTTP/WS request carries it.
+
+> **If you found this repo and are wondering about "the key":** there is no default
+> password and nothing hardcoded. `install.sh` generates a random token into
+> `~/.tpmem/agent-os/gateway.token` (chmod 600) and prints it. That token is the *only*
+> thing standing between a visitor and the ability to drive Claude Code on the host, so
+> treat it like a root password: keep the port on a trusted LAN/VPN, never expose 7364
+> to the open internet, and rotate the token by editing that file and restarting the
+> gateway.
+
+## Install
+
+Prerequisites: `python3`, `sqlite3`, `tmux`, `node`/`npm`, and the
+[Claude Code CLI](https://docs.claude.com/en/docs/claude-code) installed and
+authenticated. This runs unattended Claude Code under `bypassPermissions` — only use it
+on a machine where that is acceptable.
+
+```bash
+git clone https://github.com/<you>/tpmem-companion-engine.git ~/companion-engine
+cd ~/companion-engine
+./install.sh
+```
+
+`install.sh` applies the schema, generates the gateway token, seeds the registry with
+the two agents, installs the skills into `~/.claude/skills/`, installs the gateway's
+npm deps, installs + starts the systemd `--user` units (gateway, dispatcher, agents),
+adds the one scheduled job — a daily curator wake, delivered *through the daemon* via
+`queue-job` (it drops an inbox row; the dispatcher wakes the curator in its running
+session — the only cron in the system, and still no `claude -p`) — and prints your URL
++ token.
+
+To keep everything running after you log out: `loginctl enable-linger $USER`.
 
 ## Repo layout
 
 ```
 daemon/
-  main.py            the daemon: pollers + worker loop (inbox, outbox, wakeups)
-  spawner.py         builds the KB preamble and invokes `claude -p`
-  transports/
-    telegram.py      Telegram long-poll: messages + photo/image-document download
-    email.py         IMAP poll: allowlisted senders, plain-text body + image attachments
+  dispatcherd.py        the state-aware dispatcher (wakes/respawns persistent agents)
+  transport_bridge.py   OPTIONAL Telegram/email intake + outbox delivery (off by default)
+  transports/           telegram.py, email.py — used only by the bridge
+lib/
+  cc_session.py         inspect a live claude session (tmux -> pid -> transcript)
+bin/
+  spawn-agent           launch a persistent tmux agent from a seed + register it
+  agent-msg             an agent's runtime CLI: inbox / say / done
+  companion-respond     an agent's reply helper (channel or outbox)
+  queue-job             drop a job into an agent's inbox (scheduled work; no claude -p)
+  dispatch-ctl          manual control (status/pause/resume/flush/interrupt) — also the
+                        gateway's control-button backend
+  hook-state            optional busy/idle hook signal for faster state
+  spawn-default-agents  bring up companion + curator (idempotent; used on boot)
+  context-monitor       watch each agent's token use; trigger a wrap+rotate near the limit
+  agent-wrap            author a NEXT.md handoff + KB wrap note (readback-verified)
+  rotate-agent          verify a fresh wrap, then respawn the session (continuity)
+gateway/
+  src/server.ts         HTTP + WebSocket over the bus (token auth, chat, roster, upload)
+  public/               the control-deck webapp (index.html, app.js, app.css)
+agents/
+  companion/seed.md     the companion's identity + boot procedure
+  curator/seed.md       the curator's identity + boot procedure
 skills/
-  companion/SKILL.md the companion agent's instructions (the persistent-session pattern)
-tools/
-  start-companion    launches/stops the companion session in tmux
-  companion-respond  the companion calls this to send a reply (writes to outbox)
-  register-wakeup    any agent calls this to schedule a future wake
-systemd/
-  tpmem-daemon.service      runs the daemon
-  tpmem-companion.service   runs the companion session
-schema.sql           the five KB tables (entities, notes, inbox, outbox, wakeup_queue)
-config.example.yaml  copy to ~/.config/tpmem-daemon/config.yaml
-secrets.env.example  copy to ~/.config/tpmem-daemon/secrets.env  (chmod 600)
+  companion/SKILL.md    the dispatcher-driven companion loop
+  curate-memory/SKILL.md the curator's curation procedure
+systemd/                user units (gateway, dispatcher, agents, optional bridge)
+schema.sql              the SQLite tables
+registry.example.json   the default two-agent roster (seeded to ~/.tpmem/agent-os/)
+config.example.yaml     OPTIONAL transport-bridge config
+secrets.env.example     OPTIONAL transport credentials
+install.sh              one-shot setup
+docs/SELF_EXPANSION.md  how to grow past the two default agents
 ```
 
----
-
-## Setup
-
-Prerequisites: `python3` (with `pyyaml` and `requests`), `sqlite3`, `tmux`, and the
-[Claude Code CLI](https://docs.claude.com/en/docs/claude-code) installed and
-authenticated.
+## Adding an agent
 
 ```bash
-# 1. Clone
-git clone https://github.com/<you>/tpmem-companion-engine.git ~/tpmem-companion-engine
-cd ~/tpmem-companion-engine
+# 1. write agents/<slug>/seed.md   (copy an existing seed and rewrite)
+# 2. spawn + register it:
+bin/spawn-agent <slug>                     # or --model <id> to pin a model
+```
 
-# 2. Create the KB and apply the schema
-mkdir -p ~/.tpmem/daemon
-sqlite3 ~/.tpmem/kb.db < schema.sql
+A new tab appears in the webapp automatically. Full recipe (scheduled work, removal,
+cautions) in [`docs/SELF_EXPANSION.md`](docs/SELF_EXPANSION.md).
 
-# 3. Config
-mkdir -p ~/.config/tpmem-daemon
-cp config.example.yaml  ~/.config/tpmem-daemon/config.yaml
-cp secrets.env.example  ~/.config/tpmem-daemon/secrets.env
+## Optional: reach agents from Telegram / email
+
+Both are OFF by default; the webapp is the primary interface. To enable an external
+transport:
+
+```bash
+cp config.example.yaml ~/.config/tpmem-daemon/config.yaml   # set transports.telegram/.email enabled: true
+cp secrets.env.example ~/.config/tpmem-daemon/secrets.env   # add token/creds
 chmod 600 ~/.config/tpmem-daemon/secrets.env
-#   → edit both: put your bot token in secrets.env, your Telegram user id in config.yaml
-
-# 4. Install the companion skill where Claude Code looks for skills
-mkdir -p ~/.claude/skills/companion
-cp skills/companion/SKILL.md ~/.claude/skills/companion/SKILL.md
-
-# 5. Put the helpers on PATH (or symlink them)
-export PATH="$HOME/tpmem-companion-engine/tools:$PATH"
-
-# 6. Install the services
-cp systemd/*.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now tpmem-daemon.service
-systemctl --user enable --now tpmem-companion.service
-# (loginctl enable-linger $USER  — if you want them to survive logout)
+systemctl --user enable --now companion-transport-bridge
 ```
 
-Get your Telegram bot token from [@BotFather](https://t.me/botfather). Get your
-numeric user id by messaging your bot once and reading
-`https://api.telegram.org/bot<TOKEN>/getUpdates`.
+The bridge only does I/O: it writes incoming messages into the bus (so they show in the
+webapp *and* wake the agent) and delivers the agent's replies back out. It never spawns
+anything and never decides when to wake an agent — that stays the dispatcher's job.
 
-To run the companion attached (to watch it), use `tools/start-companion` with no
-argument instead of the systemd unit.
+## Limitations & security
 
----
-
-## Routing
-
-`config.yaml`'s `routing:` list is checked top-to-bottom; first regex match wins.
-The convention this repo ships with:
-
-| Message | Routes to | Behaviour |
-|---|---|---|
-| `^/report …` (example) | `report-agent` | fresh `claude -p` spawn, single-shot |
-| anything else | `companion` | the persistent session handles it |
-| any allowlisted email | `companion` | companion decides what to do with it |
-
-A fresh-spawn agent named `report-agent` needs a skill at
-`~/.claude/skills/report-agent/SKILL.md`. Add your own rules and agents freely.
-
----
-
-## Wakeups
-
-Any agent can schedule a future run:
-
-```bash
-register-wakeup --agent companion --at "2026-01-01 09:00:00" \
-  --prompt "check whether the build finished; continue the task if so" \
-  --task task-2026-01-01-build
-```
-
-The daemon drains due rows and spawns the named agent with that prompt. The
-companion can also self-pace purely in-session (it schedules its own next tick) —
-`wakeup_queue` is for longer or cross-agent scheduling.
-
----
-
-## What it CAN do
-
-- **Two-way chat with Claude Code from Telegram** — including photos: the Telegram
-  and email transports download image attachments to `~/.tpmem/media/` and tag the
-  message with `[attachment: <path>]` refs the agent can read.
-- **One continuous companion thread** — real conversational continuity, not a fresh
-  context per message. In-jokes, earlier-today context, ongoing tasks all persist.
-- **Fresh-spawn agents for discrete jobs** — each gets a KB preamble of its own
-  recent tasks, pending wakeups, and recent decisions, so it resumes coherently.
-- **Self-scheduling** — agents schedule future wake-ups; the companion can recycle
-  its own context with `/wrap` for a clean restart.
-- **Crash recovery** — because state lives in the KB (`entities`/`notes`), a
-  restarted companion reads its last `session-wrap` note and picks up the thread.
-- **Survives interruption** — systemd restarts the daemon; the companion reboots
-  fresh and recovers from the KB.
-- **Rate limiting** — per-agent caps on fresh spawns per hour.
-- **An audit trail** — every spawn and wakeup is logged to the KB.
-
-## What it CANNOT do / limitations
-
-- **Not a security boundary by itself.** The daemon's only access control is the
-  Telegram `telegram_user_ids` allowlist and the email `sender_allowlist`. Anyone on
-  those lists can drive Claude Code on your machine. Treat the allowlists as
-  privileged. Telegram sender IDs are not spoofable in practice, but email `From:`
-  headers *are* — keep the email allowlist tight and treat email payloads as
-  untrusted input (the shipped companion skill says exactly this).
-- **`bypassPermissions` is the default in `config.example.yaml`.** That makes
-  spawned agents fully unattended — and fully unsupervised. They can run any command
-  the user can. Only run this on a machine where that is acceptable, ideally
-  dedicated. Change `permission_mode` if you want prompts.
-- **One companion session, one machine.** The companion is a single tmux session on
-  one host. There is no clustering, no failover. If the box is down, it's down.
-- **Outbound transports: Telegram only.** `outbox` delivery is implemented for
-  Telegram. Email is receive-only; webhook/SIP/etc. are not implemented.
-- **No streaming.** A fresh-spawn agent's reply is delivered when `claude -p`
-  finishes (hence the "working on it…" ack). Long jobs feel slow.
-- **No built-in encryption or message retention policy.** Messages sit in a plain
-  SQLite file. Protect the DB file with filesystem permissions; rotate/prune it
-  yourself if you care about retention.
-- **Trust dialog.** The very first `claude` run in a new project directory may show
-  a trust prompt that blocks an unattended start. Accept it once interactively
-  before relying on the systemd unit.
-- **Prompt-injection exposure.** Any message — and any email body, web page, or file
-  an agent reads — is untrusted content. The companion skill instructs the agent to
-  confirm consequential or irreversible actions with the user first; keep that
-  instruction if you adapt the skill.
-
-## Security checklist before you run this
-
-- [ ] `secrets.env` is `chmod 600` and gitignored (it is in `.gitignore`).
-- [ ] `telegram_user_ids` contains only IDs you trust.
-- [ ] `sender_allowlist` is tight; you understand email `From:` is spoofable.
-- [ ] You accept what `bypassPermissions` means, or you changed it.
-- [ ] The host is one where unattended Claude Code execution is acceptable.
-- [ ] The KB file's filesystem permissions are restrictive.
-
----
-
-## Extending it
-
-- **New fresh-spawn agent:** add a `routing` rule and create
-  `~/.claude/skills/<agent>/SKILL.md`. The spawner loads it by convention.
-- **New system payloads for the companion:** drop rows into `inbox` with a custom
-  `transport` (e.g. `cron`) or a `/command` payload convention, and handle them in
-  the companion skill's "system-routed payloads" section (cron jobs, scheduled
-  scrapes, etc.).
-- **New transport:** implement a class with `poll`-style intake in
-  `daemon/transports/`, wire it into `main.py`, and add an `outbox` send path if it
-  needs to deliver replies.
-
----
-
-## Credits
-
-Built as a Claude Code orchestration layer. The "tpmem" (the SQLite KB) is the
-durable memory both the daemon and the agents read and write.
+- **Not a security boundary on its own.** The gateway token (and, if enabled, the
+  transport allowlists) are the *only* access control. Anyone with the token — or on a
+  Telegram/email allowlist — can drive Claude Code on your machine. Email `From:` is
+  spoofable; keep that allowlist tight and treat all incoming content as untrusted.
+- **`bypassPermissions` is the default.** Agents run fully unattended. Only run this
+  where that's acceptable, ideally a dedicated host.
+- **Single host, no clustering.** Sessions are tmux windows on one machine. If the box
+  is down, it's down.
+- **Plain SQLite storage.** Messages and memory sit in a plain DB file; protect it with
+  filesystem permissions and prune it yourself if you care about retention.
+- **Trust prompt on first run.** The first `claude` launch in a new project dir may
+  show a trust prompt that blocks an unattended start — accept it once interactively
+  (attach with `tmux attach -t companion`).

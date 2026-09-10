@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# queue-job — drop a job into an agent's inbox (the dispatcher wakes it, state-aware).
+#
+# This is the "run this in the agent's RUNNING context" primitive — it replaces
+# `claude -p` cron jobs. The row is injected as a tick into the live tmux session, so
+# the work runs with the agent's full continuity, not a cold one-shot.
+#
+#   queue-job <slug> "<payload/instruction>" [priority]
+# e.g.
+#   queue-job curator "/curate-memory — run your curation pass now"
+set -euo pipefail
+DB="${TPMEM_DB:-$HOME/.tpmem/kb.db}"
+SLUG="${1:?usage: queue-job <slug> <payload> [priority]}"
+PAYLOAD="${2:?need payload}"
+PRIORITY="${3:-normal}"
+TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+EXT_ID="job-${SLUG}-${TS}"
+
+sqlite3 "$DB" <<SQL
+INSERT OR IGNORE INTO inbox
+  (transport, external_id, user_id, reply_to, payload, status, routed_agent, priority)
+VALUES
+  ('cron', '$EXT_ID', 'cron', '', '$(printf '%s' "$PAYLOAD" | sed "s/'/''/g")', 'pending', '$SLUG', '$PRIORITY');
+SQL
+echo "queued $EXT_ID -> $SLUG ($PRIORITY)"

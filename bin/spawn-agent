@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""spawn-agent — launch a persistent Claude Code agent as a tmux session.
+
+  spawn-agent <slug> [--threshold N] [--no-register] [--model MODEL]
+
+- composes a bootstrap that points the agent at its seed, optionally primes from a
+  self-authored NEXT.md handoff, and runs the dispatcher-driven loop (no self-
+  scheduling; woken by a tick -> agent-msg inbox / say / done)
+- launches tmux session <slug> with AGENT_SLUG set, claude in bypassPermissions
+- registers it in the registry (session, session_id, channel, seed, restart command)
+- seeds the agent's channel with an 'online' marker
+
+Idempotent: refuses to spawn if the tmux session already exists.
+
+Paths (env-overridable):
+  COMPANION_ENGINE_DIR   this repo's install dir (default: resolved from this script)
+  AGENT_REGISTRY         runtime registry json (default ~/.tpmem/agent-os/registry.json)
+  TPMEM_DB               kb database (default ~/.tpmem/kb.db)
+"""
+from __future__ import annotations
+import json, os, sqlite3, subprocess, sys, uuid
+from pathlib import Path
+
+ENGINE = Path(os.environ.get("COMPANION_ENGINE_DIR",
+                             Path(__file__).resolve().parent.parent))
+DB = Path(os.environ.get("TPMEM_DB", Path.home() / ".tpmem/kb.db"))
+REGISTRY = Path(os.environ.get("AGENT_REGISTRY", Path.home() / ".tpmem/agent-os/registry.json"))
+BIN = ENGINE / "bin"
+
+BOOTSTRAP = """You are the {slug} agent, a persistent Claude Code session. \
+Boot sequence: \
+1) Read your seed {engine}/agents/{slug}/seed.md — it defines your role and how to orient. \
+2) If {engine}/agents/{slug}/NEXT.md exists, prime from it (a self-authored handoff from your predecessor) so you wake up where they left off. \
+3) Orient exactly as your seed's 'Orient on boot' section lists (read your memory/KB). \
+4) You are DISPATCHER-DRIVEN: never self-schedule a wakeup. When you are woken with a 'tick', run `{bin}/agent-msg inbox` to read pending messages, handle them, reply in your channel with `{bin}/agent-msg say "<text>"`, and clear each row with `{bin}/agent-msg done <id>`. Then stop and await the next wake. \
+5) CONTINUITY / ROTATION: when your context nears the limit the dispatcher injects a ROTATE instruction. On it, author your handoff with `{bin}/agent-wrap` (fill the wrap schema honestly); once it reports the KB readback verified, run `{bin}/rotate-agent {slug}`. Your successor primes from the NEXT.md that agent-wrap writes. Never let the harness auto-compact. \
+Right now: do the boot sequence, then post a brief 'online — oriented, awaiting work' note with `{bin}/agent-msg say`, and await your first wake. Your slug is in $AGENT_SLUG; your toolbox is {bin}."""
+
+
+def session_exists(s: str) -> bool:
+    return subprocess.run(["tmux", "has-session", "-t", s], capture_output=True).returncode == 0
+
+
+def register(slug: str, threshold: int, session_id: str, model: str | None = None) -> None:
+    try:
+        reg = json.loads(REGISTRY.read_text())
+    except Exception:
+        reg = {"agents": {}}
+    # Persist --model into the respawn command so a dispatcher-driven respawn keeps the pin.
+    spawn = f"{BIN}/spawn-agent {slug}" + (f" --model {model}" if model else "")
+    entry = {
+        "session": slug,
+        "session_id": session_id,
+        "rotate_threshold": threshold,
+        "channel": slug,
+        "seed": f"agents/{slug}/seed.md",
+        "dispatcher_managed": True,
+        "restart": {"method": "tmux", "spawn": spawn},
+    }
+    if model:
+        entry["model"] = model
+    reg.setdefault("agents", {})[slug] = entry
+    REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    REGISTRY.write_text(json.dumps(reg, indent=2) + "\n")
+
+
+def seed_channel(slug: str) -> None:
+    try:
+        c = sqlite3.connect(str(DB), timeout=15)
+        c.execute("INSERT INTO messages(channel,sender,body) VALUES (?,?,?)",
+                  (slug, "system", f"#{slug} channel created — agent spawning"))
+        c.commit(); c.close()
+    except sqlite3.Error:
+        pass
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args or args[0].startswith("--"):
+        print("usage: spawn-agent <slug> [--threshold N] [--no-register] [--model MODEL]",
+              file=sys.stderr)
+        return 2
+    slug = args[0]
+    threshold = 840_000
+    if "--threshold" in args:
+        threshold = int(args[args.index("--threshold") + 1])
+    model = None
+    if "--model" in args:
+        model = args[args.index("--model") + 1]
+
+    seed = ENGINE / "agents" / slug / "seed.md"
+    if not seed.exists():
+        print(f"spawn-agent: no seed at {seed}", file=sys.stderr)
+        return 1
+    if session_exists(slug):
+        print(f"spawn-agent: tmux session '{slug}' already exists — not respawning")
+        return 0
+
+    # write the bootstrap to a file (avoids shell-quoting a multi-line prompt)
+    boot_file = ENGINE / "agents" / slug / ".bootstrap.txt"
+    boot_file.write_text(BOOTSTRAP.format(slug=slug, engine=ENGINE, bin=BIN))
+
+    # deterministic session id -> predictable transcript filename (so tools can read
+    # the EXACT jsonl even when agents share a project dir)
+    sid = str(uuid.uuid4())
+    model_flag = f"--model {model} " if model else ""
+    cmd = (f'cd "$HOME" && AGENT_SLUG={slug} exec claude --add-dir "$HOME" '
+           f'--session-id {sid} --permission-mode bypassPermissions {model_flag}"$(cat {boot_file})"')
+    rc = subprocess.run(["tmux", "new-session", "-d", "-s", slug, "bash", "-lc", cmd],
+                        capture_output=True, text=True)
+    if rc.returncode != 0:
+        print(f"spawn-agent: tmux launch failed: {rc.stderr}", file=sys.stderr)
+        return 1
+
+    if "--no-register" not in args:
+        register(slug, threshold, sid, model)
+    seed_channel(slug)
+    print(f"spawn-agent: launched '{slug}' (tmux session, AGENT_SLUG={slug}, "
+          f"dispatcher_managed=True, threshold={threshold})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

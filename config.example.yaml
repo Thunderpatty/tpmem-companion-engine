@@ -1,73 +1,31 @@
-# tpmem-daemon config — copy to ~/.config/tpmem-daemon/config.yaml
-# Routes incoming events to agent profiles. Loaded fresh on each daemon start.
+# companion-engine — OPTIONAL transport bridge config.
+# Copy to ~/.config/tpmem-daemon/config.yaml   (only needed if you enable a transport).
+#
+# The DEFAULT interface is the local gateway webapp — you do NOT need this file for
+# that. This config only configures the optional external transport bridge, which lets
+# you also reach your agents from Telegram or email. Both transports are OFF by default.
 
-auth:
-  # Telegram user IDs allowed to interact with the daemon. ANYTHING not in this
-  # list is ignored. In a 1:1 chat with your bot, user_id == chat_id.
-  # Find yours: message your bot, then GET https://api.telegram.org/bot<TOKEN>/getUpdates
-  telegram_user_ids:
-    - 000000000          # replace with your Telegram user id
+# Which agent incoming external messages are routed to (must be a slug in the registry).
+default_agent: companion
 
-routing:
-  # First match wins. transport = telegram | email
-  # `match` is a Python regex tested against the message payload.
-  #
-  # Convention: slash-prefixed messages spawn a fresh `claude -p` for a named
-  # agent; everything else routes to the persistent "companion" session.
-  # An agent named in `agent:` must have a skill at
-  # ~/.claude/skills/<agent>/SKILL.md (the spawner loads it by convention).
+transports:
+  telegram:
+    enabled: false            # flip to true to receive/reply over Telegram
+    # Telegram user IDs allowed to talk to the bot. ANYTHING not in this list is ignored.
+    # Find yours: message your bot, then GET https://api.telegram.org/bot<TOKEN>/getUpdates
+    user_ids:
+      - 000000000             # replace with your Telegram user id
+    chunk_chars: 3800         # Telegram's hard limit is 4096; leave a margin
 
-  # Example: a slash command that spawns a fresh, single-shot agent
-  - transport: telegram
-    match: "^/report\\b"
-    agent: report-agent
-
-  # Default Telegram: the persistent companion session
-  - transport: telegram
-    match: ".*"
-    agent: companion
-
-  # All allowlisted email also goes to the companion
-  - transport: email
-    match: ".*"
-    agent: companion
-
-email:
-  # Optional. Set enabled: false if you only want Telegram.
-  enabled: false
-  poll_interval_seconds: 60
-  max_body_chars: 20000
-  # Sender allowlist — substring match against the From: address (lowercased).
-  # Anything not matching is marked \Seen and dropped.
-  sender_allowlist:
-    - "you@example.com"
-
-rate_limits:
-  default: 20            # fresh-spawn wakes per agent per hour (companion is exempt —
-                         # it is one long-lived session, not a per-message spawn)
-  per_agent:
-    report-agent: 15
-
-claude:
-  # Path to the Claude Code CLI binary.
-  binary: ~/.local/bin/claude
-  # bypassPermissions runs spawned agents unattended. Understand the security
-  # implications before using it — see README "What it can and cannot do".
-  permission_mode: bypassPermissions
-  no_session_persistence: true
-  # Extra directories the spawned agent is allowed to read/write.
-  add_dirs:
-    - ~/.tpmem
-  per_invocation_timeout_seconds: 300
-
-reply:
-  telegram_chunk_chars: 3800        # Telegram hard limit is 4096; leave a margin
-  empty_response_text: "[daemon] agent returned no output"
-
-healthcheck:
-  path: ~/.tpmem/daemon/healthcheck.touch
-  interval_seconds: 10
+  email:
+    enabled: false            # flip to true to ingest allowlisted email
+    poll_interval_seconds: 60
+    max_body_chars: 20000
+    # Substring match against the From: address (lowercased). NOTE: email From: is
+    # spoofable — keep this tight and treat email payloads as untrusted input.
+    sender_allowlist:
+      - "you@example.com"
 
 logging:
-  path: ~/.tpmem/daemon.log
+  path: ~/.tpmem/transport-bridge.log
   level: INFO

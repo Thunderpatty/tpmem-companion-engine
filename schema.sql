@@ -3,16 +3,21 @@
 -- Apply to your KB database (default ~/.tpmem/kb.db):
 --     sqlite3 ~/.tpmem/kb.db < schema.sql
 --
--- The engine needs five tables:
---   entities, notes        — the lightweight knowledge base the agents read/write
---   inbox, outbox          — incoming messages and queued replies
---   wakeup_queue           — self-scheduled future agent runs
+-- The engine uses these tables:
+--   entities, notes   — the lightweight knowledge base agents read/write (tpmem)
+--   messages          — the durable per-channel chat log (the gateway's source of truth)
+--   inbox             — pending work routed to an agent (the dispatcher wakes on it)
+--   outbox            — replies queued for an OPTIONAL external transport to deliver
+--   read_state        — per-channel read cursor for the webapp's unread badge
 --
--- entities/notes are a minimal KB. If you already have a richer KB, you only
--- need inbox / outbox / wakeup_queue plus an entity with slug='daemon-relay'
--- (the daemon logs every wake against it).
+-- Scheduled work uses cron + `queue-job` (which drops a row in `inbox`), so there is no
+-- separate wakeup queue — a scheduled task is just an inbox row the dispatcher wakes on.
+--
+-- The default install talks to agents entirely through `messages` + `inbox` via the
+-- local gateway webapp; `outbox` + the transport bridge are only used if you enable
+-- an external transport (Telegram / email), which is OFF by default.
 
--- ── knowledge base ─────────────────────────────────────────────────────────
+-- ── knowledge base (tpmem) ─────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS entities (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     type        TEXT NOT NULL,          -- person | project | task | tool | concept | agent | meta ...
@@ -41,23 +46,38 @@ CREATE INDEX IF NOT EXISTS idx_notes_entity     ON notes(entity_id);
 CREATE INDEX IF NOT EXISTS idx_notes_category   ON notes(category);
 CREATE INDEX IF NOT EXISTS idx_notes_importance ON notes(importance DESC);
 
--- ── transport queues ───────────────────────────────────────────────────────
+-- ── chat channels (durable source of truth for the webapp) ─────────────────
+-- One row per message in a channel. The gateway reads/streams this table; a human
+-- message in an agent's channel is also mirrored into `inbox` so the dispatcher
+-- wakes that agent.
+CREATE TABLE IF NOT EXISTS messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel     TEXT NOT NULL,               -- usually the agent slug
+    sender      TEXT NOT NULL,               -- 'human' | '<agent-slug>' | 'system'
+    body        TEXT NOT NULL,
+    priority    TEXT DEFAULT 'normal',       -- normal | critical
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel, id);
+
+-- ── work queues ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS inbox (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    transport     TEXT NOT NULL,             -- telegram | email | ...
+    transport     TEXT NOT NULL,             -- gateway | cron | telegram | email | ...
     external_id   TEXT,                      -- transport-side id (telegram update_id, imap uid)
     user_id       TEXT,                      -- sender id from the transport
-    reply_to      TEXT,                      -- where a reply should go (telegram chat_id, email addr)
+    reply_to      TEXT,                      -- where an external reply should go (chat_id, email addr)
     payload       TEXT NOT NULL,             -- the message body (plus [attachment: <path>] refs)
     received_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
     status        TEXT DEFAULT 'pending',    -- pending | processing | done | failed | refused
-    routed_agent  TEXT,                      -- which agent profile we routed to
+    routed_agent  TEXT,                      -- which agent this row is for (the dispatcher wakes it)
+    priority      TEXT DEFAULT 'normal',     -- normal | critical (criticals bypass the watermark)
     result        TEXT,                      -- short outcome string
     processed_at  DATETIME,
-    UNIQUE(transport, external_id)           -- idempotency: never reprocess the same update
+    UNIQUE(transport, external_id)           -- idempotency: never reprocess the same external event
 );
 CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status, received_at);
-CREATE INDEX IF NOT EXISTS idx_inbox_agent  ON inbox(routed_agent, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_inbox_agent  ON inbox(routed_agent, status, received_at DESC);
 
 CREATE TABLE IF NOT EXISTS outbox (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +85,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     reply_to      TEXT NOT NULL,
     payload       TEXT NOT NULL,
     inbox_id      INTEGER REFERENCES inbox(id) ON DELETE SET NULL,  -- optional link back
+    origin_agent  TEXT,                      -- which agent queued the reply
     status        TEXT DEFAULT 'pending',    -- pending | sent | failed
     created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
     sent_at       DATETIME,
@@ -72,28 +93,17 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status, created_at);
 
-CREATE TABLE IF NOT EXISTS wakeup_queue (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_slug      TEXT NOT NULL,         -- which agent to wake (matches an entity slug / skill name)
-    fire_at         DATETIME NOT NULL,     -- earliest time to fire
-    prompt          TEXT NOT NULL,         -- prompt to inject when waking
-    condition_type  TEXT DEFAULT 'time',   -- time | event | check
-    condition_data  TEXT,                  -- JSON, free-form per condition_type
-    task_slug       TEXT,                  -- optional link back to a task entity
-    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
-    fired_at        DATETIME,              -- NULL = pending; set when the daemon fires it
-    result          TEXT                   -- short outcome string set by the daemon
+-- ── webapp read cursor ───────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS read_state (
+    channel      TEXT PRIMARY KEY,
+    last_read_id INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_wakeup_fire  ON wakeup_queue(fire_at) WHERE fired_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_wakeup_agent ON wakeup_queue(agent_slug, fired_at);
 
--- ── required seed row ──────────────────────────────────────────────────────
--- The daemon logs every spawn/wakeup as an audit note against this entity.
-INSERT OR IGNORE INTO entities (type, slug, name, summary)
-VALUES ('meta', 'daemon-relay', 'tpmem-daemon relay log',
-        'Audit trail of every agent wake the daemon performed.');
-
--- Optional: an entity for the companion agent, so it has somewhere to log to.
+-- ── seed rows ─────────────────────────────────────────────────────────────────
+-- Every agent gets an entity so it has somewhere to log to; the two defaults:
 INSERT OR IGNORE INTO entities (type, slug, name, summary)
 VALUES ('agent', 'companion', 'Companion agent',
-        'Persistent single-thread Claude Code session handling ongoing conversation.');
+        'Persistent single-thread Claude Code session — the primary interface.');
+INSERT OR IGNORE INTO entities (type, slug, name, summary)
+VALUES ('agent', 'curator', 'Curator agent',
+        'Persistent session that maintains the memory layer on a schedule.');

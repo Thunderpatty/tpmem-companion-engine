@@ -1,0 +1,24 @@
+[Unit]
+Description=companion-engine gateway — chat webapp + HTTP/WS bus (the default interface)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# __ENGINE_DIR__ is substituted with your install path by install.sh.
+WorkingDirectory=__ENGINE_DIR__/gateway
+ExecStart=/usr/bin/env npm start
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# node/npm/tsx and the claude CLI are typically under ~/.local/bin or a node install.
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="TPMEM_DB=%h/.tpmem/kb.db"
+Environment="AGENT_REGISTRY=%h/.tpmem/agent-os/registry.json"
+# GATEWAY_TOKEN is read from ~/.tpmem/agent-os/gateway.token if not set here.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

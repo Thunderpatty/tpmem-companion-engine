@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""hook-state — deterministic busy/idle signal for the dispatcher.
+
+OPTIONAL but recommended. Wire it as Claude Code hooks (harness-fired, not model
+discretion) in the agent's settings so the app's busy indicator and the dispatcher's
+busy-guard flip instantly instead of waiting on the transcript tail:
+
+  UserPromptSubmit -> hook-state busy
+  Stop             -> hook-state idle
+
+Writes ~/.tpmem/agent-state/<slug>.json = {"state": "...", "ts": <epoch>}.
+Slug resolution: $AGENT_SLUG, else the tmux session name, else 'unknown'.
+Always exits 0 and never raises — a hook must never break the agent's turn.
+"""
+from __future__ import annotations
+import json, os, subprocess, sys, time
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("AGENT_STATE_DIR", Path.home() / ".tpmem/agent-state"))
+
+
+def slug() -> str:
+    s = os.environ.get("AGENT_SLUG")
+    if s:
+        return s
+    try:
+        r = subprocess.run(["tmux", "display-message", "-p", "#S"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def main() -> int:
+    try:
+        state = sys.argv[1] if len(sys.argv) > 1 else "idle"
+        try:
+            sys.stdin.read()  # drain the hook payload so the harness pipe doesn't block
+        except Exception:
+            pass
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        (STATE_DIR / f"{slug()}.json").write_text(
+            json.dumps({"state": state, "ts": time.time()}))
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

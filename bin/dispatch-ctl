@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""dispatch-ctl — manual control of the dispatcher (also the gateway's control backend).
+
+  dispatch-ctl status [slug]   show state/pending/pause for all or one agent
+  dispatch-ctl pause <slug>    hold all delivery to the agent
+  dispatch-ctl resume <slug>   resume delivery
+  dispatch-ctl flush <slug>    force-deliver the queue on the next cycle
+  dispatch-ctl esc <slug>      MANUAL interrupt — inject ESC into the session (stops the
+                               current turn; rare-use failsafe) and stamp state->idle
+  dispatch-ctl idle <slug>     UNSTICK — force state->idle when an agent shows busy but is
+                               actually idle (a turn that ended without firing the Stop hook)
+
+Env: TPMEM_DB, AGENT_STATE_DIR, AGENT_REGISTRY
+"""
+from __future__ import annotations
+import json, os, sqlite3, subprocess, sys, time
+from pathlib import Path
+
+DB = Path(os.environ.get("TPMEM_DB", Path.home() / ".tpmem/kb.db"))
+STATE_DIR = Path(os.environ.get("AGENT_STATE_DIR", Path.home() / ".tpmem/agent-state"))
+REGISTRY = Path(os.environ.get("AGENT_REGISTRY", Path.home() / ".tpmem/agent-os/registry.json"))
+
+
+def reg() -> dict:
+    try:
+        return json.loads(REGISTRY.read_text()).get("agents", {})
+    except Exception:
+        return {}
+
+
+def pending(slug: str) -> tuple[int, int]:
+    try:
+        con = sqlite3.connect(str(DB), timeout=15)
+        row = con.execute(
+            """SELECT count(*), COALESCE(sum(CASE WHEN priority='critical' THEN 1 ELSE 0 END),0)
+               FROM inbox WHERE routed_agent=? AND status='pending'""", (slug,)).fetchone()
+        con.close()
+        return int(row[0]), int(row[1])
+    except sqlite3.Error:
+        return 0, 0
+
+
+def state_of(slug: str) -> str:
+    p = STATE_DIR / f"{slug}.json"
+    if not p.exists():
+        return "idle?"
+    try:
+        return json.loads(p.read_text()).get("state", "?")
+    except Exception:
+        return "?"
+
+
+def status(only: str | None) -> int:
+    for slug, cfg in reg().items():
+        if only and slug != only:
+            continue
+        cnt, crit = pending(slug)
+        paused = (STATE_DIR / f"{slug}.paused").exists()
+        flush = (STATE_DIR / f"{slug}.flush").exists()
+        print(f"{slug:14} state={state_of(slug):7} pending={cnt:<3} crit={crit:<2} "
+              f"paused={paused} flush_queued={flush} session={cfg.get('session', slug)}")
+    return 0
+
+
+def touch(slug: str, name: str) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / f"{slug}.{name}").touch()
+
+
+def untouch(slug: str, name: str) -> None:
+    try:
+        (STATE_DIR / f"{slug}.{name}").unlink()
+    except OSError:
+        pass
+
+
+def stamp_idle(slug: str) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / f"{slug}.json").write_text(json.dumps({"state": "idle", "ts": time.time()}))
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 2
+    cmd = sys.argv[1]
+    arg = sys.argv[2] if len(sys.argv) > 2 else None
+
+    if cmd == "status":
+        return status(arg)
+    if not arg:
+        print(f"{cmd}: needs <slug>", file=sys.stderr)
+        return 2
+    if arg not in reg():
+        print(f"{arg}: not in registry", file=sys.stderr)
+        return 2
+    session = reg()[arg].get("session", arg)
+
+    if cmd == "pause":
+        touch(arg, "paused"); print(f"{arg}: PAUSED")
+    elif cmd == "resume":
+        untouch(arg, "paused"); print(f"{arg}: resumed")
+    elif cmd == "flush":
+        touch(arg, "flush"); print(f"{arg}: flush queued for next cycle")
+    elif cmd == "esc":
+        subprocess.run(["tmux", "send-keys", "-t", session, "Escape"], capture_output=True)
+        # An ESC-cancel ends the turn but does NOT fire the Stop hook, so the flag would
+        # remain 'busy' and the dispatcher's busy-guard would hold delivery. Stamp idle so
+        # the next cycle can re-deliver / honor a flush.
+        stamp_idle(arg)
+        print(f"{arg}: ESC injected into session '{session}' (turn interrupted; state->idle)")
+    elif cmd == "idle":
+        stamp_idle(arg)
+        print(f"{arg}: state -> idle (unstuck)")
+    else:
+        print(f"unknown command {cmd!r}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

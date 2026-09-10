@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""agent-msg — the runtime helper a persistent agent uses on a dispatcher wake.
+
+  agent-msg inbox                  list this agent's pending inbox rows
+  agent-msg say <text...>          post to this agent's own channel (live to the gateway)
+  agent-msg say --to <chan> <text> post to another agent/person's channel AS you
+                                   (also queues an inbox row so the target is woken)
+  agent-msg done <id> [result]     mark an inbox row done
+
+Agent identity comes from $AGENT_SLUG. DB from $TPMEM_DB (default ~/.tpmem/kb.db).
+"""
+from __future__ import annotations
+import os, sqlite3, sys
+from pathlib import Path
+
+DB = Path(os.environ.get("TPMEM_DB", Path.home() / ".tpmem/kb.db"))
+SLUG = os.environ.get("AGENT_SLUG")
+
+
+def con():
+    c = sqlite3.connect(str(DB), timeout=15)
+    c.execute("PRAGMA busy_timeout=15000;")
+    return c
+
+
+def need_slug() -> str:
+    if not SLUG:
+        print("agent-msg: $AGENT_SLUG not set", file=sys.stderr)
+        sys.exit(2)
+    return SLUG
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(__doc__); return 2
+    cmd = sys.argv[1]
+    slug = need_slug()
+    c = con()
+
+    if cmd == "inbox":
+        rows = c.execute(
+            """SELECT id, priority, transport, payload
+               FROM inbox WHERE routed_agent=? AND status='pending'
+               ORDER BY (priority='critical') DESC, received_at""", (slug,)).fetchall()
+        if not rows:
+            print("(no pending messages)")
+        for r in rows:
+            # full payload, not a truncated preview
+            print(f"[{r[0]}] ({r[1]}/{r[2]}) {r[3]}")
+        return 0
+
+    if cmd == "say":
+        target = slug
+        args = sys.argv[2:]
+        if args and args[0] == "--to":
+            if len(args) < 2:
+                print("agent-msg say --to: need a target channel", file=sys.stderr); return 2
+            target = args[1]; args = args[2:]
+        body = " ".join(args).strip()
+        if not body:
+            print("agent-msg say: need text", file=sys.stderr); return 2
+        c.execute("INSERT INTO messages(channel,sender,body) VALUES (?,?,?)", (target, slug, body))
+        # Addressing another channel: also queue an inbox row so that agent is woken
+        # (the gateway's human->inbox bridge only fires for sender 'human').
+        if target != slug:
+            c.execute("INSERT INTO inbox(transport,payload,routed_agent) VALUES ('gateway',?,?)",
+                      (f"[from {slug}] {body}", target))
+        c.commit()
+        print(f"posted to #{target}")
+        return 0
+
+    if cmd == "done":
+        if len(sys.argv) < 3:
+            print("agent-msg done: need <id>", file=sys.stderr); return 2
+        rid = sys.argv[2]
+        res = " ".join(sys.argv[3:]) or "handled"
+        c.execute("UPDATE inbox SET status='done', result=?, processed_at=CURRENT_TIMESTAMP "
+                  "WHERE id=? AND routed_agent=?", (res, rid, slug))
+        c.commit()
+        print(f"marked inbox {rid} done")
+        return 0
+
+    print(f"unknown command {cmd!r}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

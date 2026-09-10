@@ -1,0 +1,30 @@
+{
+  "_comment": "Default agent registry — the two agents the engine ships with. install.sh copies this to the runtime location (default ~/.tpmem/agent-os/registry.json), substituting __ENGINE_DIR__ with your install path. spawn-agent updates each entry's session_id when it launches the agent, and appends new entries when you spin up more agents (see docs/SELF_EXPANSION.md). Only agents with dispatcher_managed=true are driven by the dispatcher.",
+  "agents": {
+    "companion": {
+      "session": "companion",
+      "session_id": null,
+      "rotate_threshold": 840000,
+      "channel": "companion",
+      "seed": "agents/companion/seed.md",
+      "dispatcher_managed": true,
+      "restart": {
+        "method": "tmux",
+        "spawn": "__ENGINE_DIR__/bin/spawn-agent companion"
+      }
+    },
+    "curator": {
+      "session": "curator",
+      "session_id": null,
+      "rotate_threshold": 840000,
+      "channel": "curator",
+      "seed": "agents/curator/seed.md",
+      "dispatcher_managed": true,
+      "schedule": "daily /curate-memory via cron + queue-job (see install.sh)",
+      "restart": {
+        "method": "tmux",
+        "spawn": "__ENGINE_DIR__/bin/spawn-agent curator"
+      }
+    }
+  }
+}

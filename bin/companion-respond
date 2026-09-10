@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# companion-respond — an agent calls this to send a reply.
+#
+# For a message that came in over the local gateway/webapp (the default), the reply is
+# posted straight to the agent's channel (the `messages` table), where the gateway's
+# live feed picks it up. For a message that came in over an OPTIONAL external transport
+# (Telegram / email), the reply is queued on the `outbox` for the transport bridge to
+# deliver — the agent never touches the transport directly.
+#
+# Usage:
+#   companion-respond --inbox-id <id> --message "<text>"
+#       reply to the sender of inbox row <id>, on whatever transport it arrived on
+#
+#   companion-respond --channel <name> --message "<text>"
+#       unsolicited post straight to a channel's live feed (e.g. a boot "back online"
+#       ping). No inbox row to close.
+#
+#   companion-respond --transport telegram --reply-to <chat_id> --message "<text>"
+#       unsolicited send over an external transport (needs the transport bridge running)
+#
+#   companion-respond --inbox-id <id> --message-stdin <<'EOF'
+#   message body — a single-quoted heredoc preserves $, backticks, $(...) verbatim
+#   EOF
+#       PREFERRED — the argv path is corrupted by caller shell expansion; stdin is opaque.
+
+set -euo pipefail
+DB="${TPMEM_DB:-$HOME/.tpmem/kb.db}"
+
+INBOX_ID=""
+TRANSPORT=""
+REPLY_TO=""
+CHANNEL=""
+MESSAGE=""
+USE_STDIN=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --inbox-id)       INBOX_ID="$2"; shift 2 ;;
+    --transport)      TRANSPORT="$2"; shift 2 ;;
+    --reply-to)       REPLY_TO="$2"; shift 2 ;;
+    --channel)        CHANNEL="$2"; shift 2 ;;
+    --message)        MESSAGE="$2"; shift 2 ;;
+    --message-stdin)  USE_STDIN=1; shift ;;
+    -h|--help)
+      grep '^# ' "$0" | head -30
+      exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ "$USE_STDIN" -eq 1 ]; then
+  if [ -n "$MESSAGE" ]; then
+    echo "cannot combine --message and --message-stdin" >&2; exit 2
+  fi
+  MESSAGE=$(cat)
+fi
+
+if [ -z "$MESSAGE" ]; then
+  echo "usage: companion-respond --inbox-id <id> --message <text>" >&2
+  echo "   or: companion-respond --channel <name> --message <text>" >&2
+  echo "   or: companion-respond --transport telegram --reply-to <chat_id> --message <text>" >&2
+  echo "   or: companion-respond --inbox-id <id> --message-stdin <<'EOF' ... EOF  (preferred)" >&2
+  exit 1
+fi
+
+esc() { printf '%s' "$1" | sed "s/'/''/g"; }
+
+if [ -n "$INBOX_ID" ]; then
+  ROW=$(sqlite3 -separator '|' "$DB" "SELECT transport, reply_to, routed_agent FROM inbox WHERE id=$INBOX_ID;")
+  if [ -z "$ROW" ]; then
+    echo "no inbox row with id=$INBOX_ID" >&2
+    exit 1
+  fi
+  TRANSPORT="${ROW%%|*}"
+  REST="${ROW#*|}"
+  REPLY_TO="${REST%%|*}"
+  ROUTED_AGENT="${REST#*|}"
+
+  case "$TRANSPORT" in
+    gateway|channel|cron)
+      # Local-origin rows have no deliverable outbox path; the gateway live-feed reads the
+      # `messages` table. Post straight to the agent's own channel (same path as agent-msg say).
+      CHAN="${ROUTED_AGENT:-$TRANSPORT}"
+      sqlite3 "$DB" "INSERT INTO messages (channel, sender, body) VALUES ('$(esc "$CHAN")', '$(esc "$CHAN")', '$(esc "$MESSAGE")');"
+      sqlite3 "$DB" "UPDATE inbox SET status='done', result='replied (channel #$(esc "$CHAN"))', processed_at=CURRENT_TIMESTAMP WHERE id=$INBOX_ID;"
+      echo "posted reply to #$CHAN (gateway live-feed) for inbox=$INBOX_ID"
+      ;;
+    *)
+      # External transport (telegram/email/...): queue on the outbox for the bridge.
+      OUT_ID=$(sqlite3 "$DB" "INSERT INTO outbox (transport, reply_to, payload, inbox_id, origin_agent)
+        VALUES ('$(esc "$TRANSPORT")', '$(esc "$REPLY_TO")', '$(esc "$MESSAGE")', $INBOX_ID, '${ROUTED_AGENT:-agent}');
+        SELECT last_insert_rowid();")
+      sqlite3 "$DB" "UPDATE inbox SET status='done', result='replied (outbox $OUT_ID)', processed_at=CURRENT_TIMESTAMP WHERE id=$INBOX_ID;"
+      echo "queued reply outbox=$OUT_ID for inbox=$INBOX_ID transport=$TRANSPORT"
+      ;;
+  esac
+elif [ -n "$CHANNEL" ]; then
+  sqlite3 "$DB" "INSERT INTO messages (channel, sender, body) VALUES ('$(esc "$CHANNEL")', '$(esc "$CHANNEL")', '$(esc "$MESSAGE")');"
+  echo "posted unsolicited to #$CHANNEL (gateway live-feed)"
+else
+  if [ -z "$TRANSPORT" ] || [ -z "$REPLY_TO" ]; then
+    echo "must provide --inbox-id OR --channel <name> OR (--transport AND --reply-to)" >&2
+    exit 1
+  fi
+  OUT_ID=$(sqlite3 "$DB" "INSERT INTO outbox (transport, reply_to, payload, origin_agent)
+    VALUES ('$(esc "$TRANSPORT")', '$(esc "$REPLY_TO")', '$(esc "$MESSAGE")', 'agent');
+    SELECT last_insert_rowid();")
+  echo "queued unsolicited outbox=$OUT_ID transport=$TRANSPORT to=$REPLY_TO"
+fi

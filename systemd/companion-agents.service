@@ -1,0 +1,22 @@
+[Unit]
+Description=companion-engine agents — spawn the two default persistent agents (companion + curator)
+After=network-online.target companion-dispatcher.service
+Wants=network-online.target
+# tmux new-session -d daemonizes, so this is a oneshot: it launches the sessions and
+# stays "active" without owning the tmux process tree. The dispatcher respawns any that
+# die while there is pending work; this just guarantees the two defaults are up on boot.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="COMPANION_ENGINE_DIR=__ENGINE_DIR__"
+Environment="TPMEM_DB=%h/.tpmem/kb.db"
+Environment="AGENT_REGISTRY=%h/.tpmem/agent-os/registry.json"
+ExecStart=__ENGINE_DIR__/bin/spawn-default-agents
+# Best-effort clean stop of the two default sessions ('-' = ignore failure if already gone).
+ExecStop=-/usr/bin/tmux kill-session -t companion
+ExecStop=-/usr/bin/tmux kill-session -t curator
+
+[Install]
+WantedBy=default.target

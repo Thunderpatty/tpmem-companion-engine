@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""agent-wrap — write an agent's self-authored handoff to the durable layer.
+
+This is the middle of the continuity/wrap system: when context-monitor tells an agent
+to ROTATE, the agent authors a wrap and pipes it here. agent-wrap writes it to:
+  1. agents/<slug>/wraps/<UTC-ts>.md   permanent, diffable history
+  2. agents/<slug>/NEXT.md             the "resume here" pointer the successor primes from
+  3. a KB note, source  wrap:<slug>:<UTC-ts>   the durable, queryable copy
+
+Then it READBACK-VERIFIES the KB row exists (in a fresh connection) before exiting 0.
+This is the fix for the race where a restart killed the wrap INSERT and the successor
+cold-started with nothing: if the readback fails, agent-wrap exits non-zero so
+rotate-agent's freshness gate refuses to restart and no handoff is lost.
+
+Reads a wrap JSON object on stdin. Recognised sections (all optional, list-valued):
+  done, open, next, decisions, rejected, gotchas, insights, watch, pointers
+plus top-level: agent (required), wrap_reason, session_id, predecessor_id, ctx_tokens, model.
+
+Usage:
+  echo '<wrap json>' | agent-wrap
+  agent-wrap < wrap.json
+Env:
+  COMPANION_ENGINE_DIR  (default: resolved from this script)
+  AGENT_REGISTRY        (default ~/.tpmem/agent-os/registry.json)
+  TPMEM_DB              (default ~/.tpmem/kb.db)
+"""
+from __future__ import annotations
+import json, os, sqlite3, sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+ENGINE = Path(os.environ.get("COMPANION_ENGINE_DIR",
+                             Path(__file__).resolve().parent.parent))
+DB = Path(os.environ.get("TPMEM_DB", Path.home() / ".tpmem/kb.db"))
+REGISTRY = Path(os.environ.get("AGENT_REGISTRY", Path.home() / ".tpmem/agent-os/registry.json"))
+
+SECTIONS = ["done", "open", "next", "decisions", "rejected", "gotchas", "insights", "watch", "pointers"]
+
+
+def registry_session_id(slug: str) -> str | None:
+    """Read the agent's current session_id from the registry so the wrap records a
+    breadcrumb back to the raw transcript even if the author forgets to pass it — the
+    successor is never left hunting for the predecessor's jsonl by file size."""
+    try:
+        reg = json.loads(REGISTRY.read_text())
+        return (reg.get("agents", {}).get(slug, {}) or {}).get("session_id")
+    except Exception:
+        return None
+
+
+def utc_ts() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def render_md(w: dict, ts: str) -> str:
+    lines = [f"# Wrap — {w['agent']} — {ts}", ""]
+    meta = [f"- **reason:** {w.get('wrap_reason', '?')}"]
+    for k in ("session_id", "predecessor_id", "ctx_tokens", "model"):
+        if w.get(k) not in (None, ""):
+            meta.append(f"- **{k}:** {w[k]}")
+    lines += meta + [""]
+    for sec in SECTIONS:
+        items = w.get(sec) or []
+        # A bare string here would iterate char-by-char below and mangle the wrap —
+        # coerce to a one-item list instead.
+        if isinstance(items, str):
+            items = [items]
+        if not items:
+            continue
+        lines.append(f"## {sec}")
+        for it in items:
+            lines.append(f"- {it}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def kb_write_and_verify(slug: str, ts: str, md: str) -> bool:
+    """Insert the wrap as a KB note, then read it back in a FRESH connection. Returns
+    True only if the row is durably present on disk."""
+    source = f"wrap:{slug}:{ts}"
+    try:
+        con = sqlite3.connect(str(DB), timeout=15)
+        con.execute("PRAGMA busy_timeout=15000;")
+        con.execute(
+            """INSERT INTO notes (entity_id, category, content, importance, tags, source)
+               VALUES ((SELECT id FROM entities WHERE slug=?), 'audit', ?, 7, ?, ?)""",
+            (slug, md, f"wrap,handoff,{slug}", source),
+        )
+        con.commit()
+        con.close()
+        ver = sqlite3.connect(str(DB), timeout=15)
+        row = ver.execute("SELECT 1 FROM notes WHERE source=? LIMIT 1", (source,)).fetchone()
+        ver.close()
+        return row is not None
+    except sqlite3.Error as e:
+        print(f"agent-wrap: KB write failed: {e}", file=sys.stderr)
+        return False
+
+
+def main() -> int:
+    try:
+        w = json.load(sys.stdin)
+    except json.JSONDecodeError as e:
+        print(f"agent-wrap: invalid JSON on stdin: {e}", file=sys.stderr)
+        return 2
+    slug = w.get("agent")
+    if not slug:
+        print("agent-wrap: 'agent' is required", file=sys.stderr)
+        return 2
+    w.setdefault("wrap_reason", "manual")
+    # Breadcrumb to the raw transcript: if the author didn't pass session_id, pull the
+    # current one from the registry so the successor is never left hunting.
+    if not w.get("session_id"):
+        sid = registry_session_id(slug)
+        if sid:
+            w["session_id"] = sid
+
+    ts = utc_ts()
+    md = render_md(w, ts)
+
+    adir = ENGINE / "agents" / slug
+    (adir / "wraps").mkdir(parents=True, exist_ok=True)
+    wrap_file = adir / "wraps" / f"{ts.replace(':', '')}.md"
+    wrap_file.write_text(md)
+    (adir / "NEXT.md").write_text(md)
+
+    if not kb_write_and_verify(slug, ts, md):
+        print("agent-wrap: KB readback FAILED — do NOT rotate; wrap is not durable", file=sys.stderr)
+        return 1
+
+    print(f"agent-wrap: OK  {wrap_file}")
+    print(f"agent-wrap: KB source wrap:{slug}:{ts} verified — safe to rotate")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -6,9 +6,16 @@ secrets.env
 # Runtime artifacts
 *.log
 *.touch
-healthcheck.touch
 __pycache__/
 *.py[cod]
+
+# Runtime state written into the working tree by spawn-agent (per-agent, not template)
+agents/*/.bootstrap.txt
+agents/*/NEXT.md
+
+# Node
+node_modules/
+dist/
 
 # Local DB
 *.db

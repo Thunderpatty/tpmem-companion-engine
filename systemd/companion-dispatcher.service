@@ -1,0 +1,19 @@
+[Unit]
+Description=companion-engine dispatcher — wakes persistent agents when their inbox has work
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 __ENGINE_DIR__/daemon/dispatcherd.py
+Restart=always
+RestartSec=10
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="TPMEM_DB=%h/.tpmem/kb.db"
+Environment="AGENT_REGISTRY=%h/.tpmem/agent-os/registry.json"
+Environment="AGENT_STATE_DIR=%h/.tpmem/agent-state"
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

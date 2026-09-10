@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""rotate-agent — verify a fresh wrap exists, then signal the dispatcher to respawn.
+
+The safety invariant: NEVER trigger a respawn unless a durable, recent wrap is confirmed
+in the KB. This is what makes rotation lossless — it closes the legacy race where a
+restart killed the wrap INSERT and the successor cold-started.
+
+Steps:
+  1. Confirm a KB wrap row for <slug> (source 'wrap:<slug>:%') written within
+     --max-age-min (default 10). No wrap, or a stale one -> ABORT (author one first).
+  2. Signal the respawn per the registry's restart method:
+       - method "tmux": write a `<slug>.rotate` marker into the state dir. The dispatcher
+         (external to this session) sees it, kills the tmux session, and respawns from
+         the registry. We do NOT kill the session here: rotate-agent runs INSIDE the very
+         session that would be killed, so a synchronous kill would terminate this process
+         before the successor could spawn. Handing it to the dispatcher mirrors the
+         flag->daemon path and keeps the kill+respawn external.
+       - method "flag": touch the restart flag file; a supervising daemon respawns it.
+  3. The successor boots, reads agents/<slug>/NEXT.md (+ the KB wrap), and resumes.
+
+Usage:
+  rotate-agent <slug> [--max-age-min N] [--dry-run]
+Env:
+  AGENT_REGISTRY  (default ~/.tpmem/agent-os/registry.json)
+  TPMEM_DB        (default ~/.tpmem/kb.db)
+  AGENT_STATE_DIR (default ~/.tpmem/agent-state)
+"""
+from __future__ import annotations
+import calendar, json, os, sqlite3, sys, time
+from pathlib import Path
+
+DB = Path(os.environ.get("TPMEM_DB", Path.home() / ".tpmem/kb.db"))
+STATE_DIR = Path(os.environ.get("AGENT_STATE_DIR", Path.home() / ".tpmem/agent-state"))
+REGISTRY = Path(os.environ.get("AGENT_REGISTRY", Path.home() / ".tpmem/agent-os/registry.json"))
+
+
+def latest_wrap_age_min(slug: str) -> float | None:
+    """Minutes since the newest KB wrap row for slug, or None if there is none."""
+    try:
+        con = sqlite3.connect(str(DB), timeout=15)
+        row = con.execute(
+            """SELECT created_at FROM notes
+               WHERE source LIKE ? ORDER BY created_at DESC LIMIT 1""",
+            (f"wrap:{slug}:%",),
+        ).fetchone()
+        con.close()
+    except sqlite3.Error as e:
+        print(f"rotate-agent: KB read failed: {e}", file=sys.stderr)
+        return None
+    if not row:
+        return None
+    # created_at is stored as UTC 'YYYY-MM-DD HH:MM:SS'. Use timegm (UTC), not mktime
+    # (local), so the age is correct regardless of the host timezone.
+    try:
+        epoch_utc = calendar.timegm(time.strptime(row[0], "%Y-%m-%d %H:%M:%S"))
+        return (time.time() - epoch_utc) / 60.0
+    except Exception:
+        return 0.0  # row exists but unparseable timestamp — treat as fresh
+
+
+def signal_restart(slug: str, cfg: dict, dry: bool) -> int:
+    r = cfg.get("restart", {})
+    method = r.get("method")
+    if method == "flag":
+        flag = Path(os.path.expanduser(r["flag"]))
+        print(f"rotate-agent: restart via flag {flag}")
+        if not dry:
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.touch()
+        return 0
+    if method == "tmux":
+        session = cfg.get("session", slug)
+        marker = STATE_DIR / f"{slug}.rotate"
+        print(f"rotate-agent: signaling dispatcher to rotate tmux session '{session}' "
+              f"(marker {marker})")
+        if not dry:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps(
+                {"slug": slug, "session": session, "requested_at": time.time(),
+                 "spawn": r.get("spawn")}))
+        return 0
+    print(f"rotate-agent: unknown restart method {method!r}", file=sys.stderr)
+    return 2
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args or args[0].startswith("--"):
+        print("usage: rotate-agent <slug> [--max-age-min N] [--dry-run]", file=sys.stderr)
+        return 2
+    slug = args[0]
+    dry = "--dry-run" in args
+    max_age = 10.0
+    if "--max-age-min" in args:
+        max_age = float(args[args.index("--max-age-min") + 1])
+
+    try:
+        reg = json.loads(REGISTRY.read_text()).get("agents", {})
+    except Exception as e:
+        print(f"rotate-agent: cannot read registry {REGISTRY}: {e}", file=sys.stderr)
+        return 2
+    cfg = reg.get(slug)
+    if not cfg:
+        print(f"rotate-agent: {slug} not in registry", file=sys.stderr)
+        return 2
+
+    age = latest_wrap_age_min(slug)
+    if age is None:
+        print(f"rotate-agent: ABORT — no wrap found for {slug}. Run agent-wrap first.",
+              file=sys.stderr)
+        return 1
+    if age > max_age:
+        print(f"rotate-agent: ABORT — newest wrap is {age:.1f} min old (> {max_age}). "
+              f"Author a fresh wrap before rotating.", file=sys.stderr)
+        return 1
+
+    print(f"rotate-agent: wrap verified ({age:.1f} min old) — proceeding to rotate {slug}")
+    rc = signal_restart(slug, cfg, dry)
+    if rc == 0:
+        print(f"rotate-agent: {'(dry-run) ' if dry else ''}rotation signaled for {slug}. "
+              f"Successor will prime from agents/{slug}/NEXT.md")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""context-monitor — watch each agent's token usage and signal a rotate near the limit.
+
+This is the standalone / manual face of the token watchdog. The SAME logic runs on the
+dispatcher's normal cycle (see daemon/dispatcherd.py), so rotation is triggered by token
+count with NO separate cron or watcher — this CLI is for one-off checks and the --status
+view. The core lives in lib/context_monitor.py.
+
+For each dispatcher-managed agent in the registry, resolve its live context usage and,
+if it has crossed the agent's rotate_threshold AND the agent is idle, inject a ROTATE
+instruction into its tmux session (it then runs agent-wrap + rotate-agent). Deduped per
+crossing; re-arms when usage drops (after the successor boots).
+
+  context-monitor                # check all registered agents (may inject ROTATE)
+  context-monitor <slug> ...     # check only the named agent(s)
+  context-monitor --status       # print + cache context for all; never inject
+  context-monitor --dry-run      # decide + log what WOULD happen; no inject/state write
+
+Env: AGENT_REGISTRY (default ~/.tpmem/agent-os/registry.json), AGENT_STATE_DIR,
+     COMPANION_ENGINE_DIR, CC_CONTEXT_WINDOW.
+"""
+from __future__ import annotations
+import json, os, sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import context_monitor as ctxmon  # noqa: E402
+
+REGISTRY = Path(os.environ.get("AGENT_REGISTRY", Path.home() / ".tpmem/agent-os/registry.json"))
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    status_only = "--status" in args
+    dry_run = "--dry-run" in args
+    only = [a for a in args if not a.startswith("--")]
+    try:
+        reg = json.loads(REGISTRY.read_text()).get("agents", {})
+    except Exception as e:
+        print(f"context-monitor: cannot read registry {REGISTRY}: {e}", file=sys.stderr)
+        return 1
+    targets = only or list(reg.keys())
+    for slug in targets:
+        cfg = reg.get(slug)
+        if not cfg:
+            print(f"{slug}: not in registry — skip")
+            continue
+        # idle=None -> the CLI uses the hook-state flag as its busy test.
+        ctxmon.check(slug, cfg, idle=None, status_only=status_only, dry_run=dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

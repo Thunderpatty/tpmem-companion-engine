@@ -1,0 +1,24 @@
+[Unit]
+Description=companion-engine transport bridge — OPTIONAL external transport (Telegram/email)
+After=network-online.target
+Wants=network-online.target
+# OPTIONAL and OFF by default. The default interface is the gateway webapp. Enable this
+# only if you also want to reach your agents from Telegram or email:
+#   1. set transports.telegram.enabled (and/or .email) true in ~/.config/tpmem-daemon/config.yaml
+#   2. put credentials in ~/.config/tpmem-daemon/secrets.env  (chmod 600)
+#   3. systemctl --user enable --now companion-transport-bridge
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 __ENGINE_DIR__/daemon/transport_bridge.py
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=5
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="TPMEM_DB=%h/.tpmem/kb.db"
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
