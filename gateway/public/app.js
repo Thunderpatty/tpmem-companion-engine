@@ -571,3 +571,28 @@ function isNearBottom() {
   }
 })();
 
+
+/* ---------------------------------------------------------------------------
+   Resilient catch-up (mobile WebSocket reliability)
+   On a phone the WS silently drops when the screen locks or the tab is
+   backgrounded; the reconnect reopens the socket but doesn't backfill messages
+   that arrived during the gap, so replies land in the DB but never render.
+   A lightweight incremental poll + a re-sync on tab-visible guarantee the
+   thread stays current regardless of socket state. renderMessage() de-dupes by
+   id (state.seenIds) and advances state.lastId, so this never double-renders.
+--------------------------------------------------------------------------- */
+async function catchUpMessages() {
+  if (!state.token || !state.active) return;
+  const ag = activeAgent();
+  if (!ag) return;
+  try {
+    const data = await api(`/messages?channel=${encodeURIComponent(ag.channel)}&since=${state.lastId || 0}`);
+    (data.messages || []).forEach((m) => {
+      const atBottom = isNearBottom();
+      renderMessage(m, false);
+      if (atBottom) scrollBottom();
+    });
+  } catch { /* transient; next tick retries */ }
+}
+setInterval(catchUpMessages, 4000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) catchUpMessages(); });
