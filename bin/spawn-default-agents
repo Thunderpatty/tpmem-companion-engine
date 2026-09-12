@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# spawn-default-agents — bring up the two default persistent agents (companion + curator).
+# spawn-default-agents — bring up the two default persistent agents (companion + curator),
+# honoring each agent's model pin from the runtime registry.
 #
 # Idempotent: spawn-agent refuses to relaunch a session that already exists, so this is
 # safe to run on every boot (it's what the companion-agents.service oneshot calls).
@@ -9,7 +10,18 @@
 set -euo pipefail
 ENGINE_DIR="${COMPANION_ENGINE_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 BIN="$ENGINE_DIR/bin"
+REGISTRY="${AGENT_REGISTRY:-$HOME/.tpmem/agent-os/registry.json}"
 
 for slug in companion curator; do
-  "$BIN/spawn-agent" "$slug" || echo "spawn-default-agents: '$slug' spawn returned nonzero (may already be running)"
+  model=""
+  if [ -f "$REGISTRY" ]; then
+    model=$(python3 -c "import json;print((json.load(open('$REGISTRY'))['agents'].get('$slug') or {}).get('model') or '')" 2>/dev/null || true)
+  fi
+  if [ -n "$model" ]; then
+    "$BIN/spawn-agent" "$slug" --model "$model" \
+      || echo "spawn-default-agents: '$slug' spawn returned nonzero (may already be running)"
+  else
+    "$BIN/spawn-agent" "$slug" \
+      || echo "spawn-default-agents: '$slug' spawn returned nonzero (may already be running)"
+  fi
 done
