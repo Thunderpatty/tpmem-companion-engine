@@ -16,6 +16,9 @@ Paths (env-overridable):
   COMPANION_ENGINE_DIR   this repo's install dir (default: resolved from this script)
   AGENT_REGISTRY         runtime registry json (default ~/.tpmem/agent-os/registry.json)
   TPMEM_DB               kb database (default ~/.tpmem/kb.db)
+  COLLAB_DOC             "how to work with the user" doc, git-pulled + attached to the
+                         top of every agent's context on each spawn (default
+                         ~/agentic-collaboration/README.md; skipped if absent)
 """
 from __future__ import annotations
 import json, os, sqlite3, subprocess, sys, uuid
@@ -26,15 +29,41 @@ ENGINE = Path(os.environ.get("COMPANION_ENGINE_DIR",
 DB = Path(os.environ.get("TPMEM_DB", Path.home() / ".tpmem/kb.db"))
 REGISTRY = Path(os.environ.get("AGENT_REGISTRY", Path.home() / ".tpmem/agent-os/registry.json"))
 BIN = ENGINE / "bin"
+COLLAB_DOC = Path(os.environ.get("COLLAB_DOC", Path.home() / "agentic-collaboration/README.md"))
 
 BOOTSTRAP = """You are the {slug} agent, a persistent Claude Code session. \
 Boot sequence: \
+0) The 'HOW TO WORK WITH THE USER' guide is attached at the very top of this message (when present) — it governs everything you do; treat it as standing operating context, not a one-time read. \
 1) Read your seed {engine}/agents/{slug}/seed.md — it defines your role and how to orient. \
 2) If {engine}/agents/{slug}/NEXT.md exists, prime from it (a self-authored handoff from your predecessor) so you wake up where they left off. \
 3) Orient exactly as your seed's 'Orient on boot' section lists (read your memory/KB). \
 4) You are DISPATCHER-DRIVEN: never self-schedule a wakeup. When you are woken with a 'tick', run `{bin}/agent-msg inbox` to read pending messages, handle them, reply in your channel with `{bin}/agent-msg say "<text>"`, and clear each row with `{bin}/agent-msg done <id>`. Then stop and await the next wake. \
 5) CONTINUITY / ROTATION: when your context nears the limit the dispatcher injects a ROTATE instruction. On it, author your handoff with `{bin}/agent-wrap` (fill the wrap schema honestly); once it reports the KB readback verified, run `{bin}/rotate-agent {slug}`. Your successor primes from the NEXT.md that agent-wrap writes. Never let the harness auto-compact. \
 Right now: do the boot sequence, then post a brief 'online — oriented, awaiting work' note with `{bin}/agent-msg say`, and await your first wake. Your slug is in $AGENT_SLUG; your toolbox is {bin}."""
+
+
+def collab_preamble() -> str:
+    """Git-pull (best-effort) and return the 'how to work with the user' doc, fenced,
+    to prepend to the bootstrap so it is attached at the very top of the agent's
+    context on every spawn/rotate. Returns '' if the doc is absent."""
+    if not COLLAB_DOC.exists():
+        return ""
+    # honor "user edits it via the website" — refresh from origin, but never block a spawn
+    if (COLLAB_DOC.parent / ".git").exists():
+        try:
+            subprocess.run(["git", "-C", str(COLLAB_DOC.parent), "pull", "--quiet",
+                            "--no-rebase"], capture_output=True, timeout=25)
+        except Exception:
+            pass
+    try:
+        doc = COLLAB_DOC.read_text()
+    except Exception:
+        return ""
+    return ("=== HOW TO WORK WITH THE USER — standing operating context, read first ===\n"
+            f"(source: {COLLAB_DOC}, refreshed at spawn)\n\n"
+            f"{doc}\n"
+            "=== END HOW TO WORK WITH THE USER — the guide above governs all your work; "
+            "the boot steps below are how you operate ===\n\n")
 
 
 def session_exists(s: str) -> bool:
@@ -96,9 +125,13 @@ def main() -> int:
         print(f"spawn-agent: tmux session '{slug}' already exists — not respawning")
         return 0
 
-    # write the bootstrap to a file (avoids shell-quoting a multi-line prompt)
+    # write the bootstrap to a file (avoids shell-quoting a multi-line prompt).
+    # The collaboration guide is prepended so it sits at the very top of the agent's
+    # initial context on every spawn/rotate — part of the daemon architecture, not a
+    # per-seed convention an agent could omit.
     boot_file = ENGINE / "agents" / slug / ".bootstrap.txt"
-    boot_file.write_text(BOOTSTRAP.format(slug=slug, engine=ENGINE, bin=BIN))
+    boot_file.write_text(collab_preamble()
+                         + BOOTSTRAP.format(slug=slug, engine=ENGINE, bin=BIN))
 
     # deterministic session id -> predictable transcript filename (so tools can read
     # the EXACT jsonl even when agents share a project dir)
