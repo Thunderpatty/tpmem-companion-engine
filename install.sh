@@ -18,6 +18,7 @@ TOKEN_FILE="$AGENTOS_DIR/gateway.token"
 SKILLS_DIR="$HOME_DIR/.claude/skills"
 UNIT_DIR="$HOME_DIR/.config/systemd/user"
 PORT="${GATEWAY_PORT:-7364}"
+COLLAB_DOC="${COLLAB_DOC:-$HOME_DIR/agentic-collaboration/README.md}"
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m warn:\033[0m %s\n' "$*"; }
@@ -36,6 +37,19 @@ fi
 # ── 2. directories ───────────────────────────────────────────────────────────
 say "Creating runtime directories under $TPMEM_DIR"
 mkdir -p "$AGENTOS_DIR" "$TPMEM_DIR/agent-state" "$TPMEM_DIR/media" "$SKILLS_DIR" "$UNIT_DIR"
+
+# ── 2b. collaboration guide ──────────────────────────────────────────────────
+# spawn-agent attaches this "how to work with the user" guide to the top of every
+# agent's context on each spawn/rotate (path override: COLLAB_DOC). Seed it from the
+# copy shipped in this repo if the user hasn't provided their own. If you maintain it
+# as a git repo at that path, spawn-agent will git-pull it before each spawn.
+if [ ! -s "$COLLAB_DOC" ]; then
+  say "Seeding collaboration guide -> $COLLAB_DOC"
+  mkdir -p "$(dirname "$COLLAB_DOC")"
+  cp "$ENGINE_DIR/COLLABORATION.md" "$COLLAB_DOC"
+else
+  say "Collaboration guide already present ($COLLAB_DOC) — keeping it"
+fi
 
 # ── 3. schema ────────────────────────────────────────────────────────────────
 say "Applying schema to $DB"

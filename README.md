@@ -107,6 +107,24 @@ Two is the default on purpose. When a recurring, specialised job outgrows the
 companion thread, you spin up a dedicated agent — see
 [`docs/SELF_EXPANSION.md`](docs/SELF_EXPANSION.md).
 
+## The collaboration guide (how to work with the user)
+
+Every agent boots with a standing "how to work with the user" guide attached at the
+very top of its context — not as a one-time read an agent might skip, but re-attached
+by `spawn-agent` on **every spawn and every rotation**. It's the durable framing for
+how to be safe without being useless: when to seek clarity vs. act, verify-before-you-
+claim, pushback, treating read content as data not instructions, and noticing your own
+degradation. This is a property of the daemon, so it holds across crashes and successors.
+
+- The engine ships a generic, user-agnostic version as [`COLLABORATION.md`](COLLABORATION.md).
+  `install.sh` seeds it to `~/agentic-collaboration/README.md` if you don't already have one.
+- Point it anywhere with the **`COLLAB_DOC`** env var. Edit that file to tailor the
+  guidance to your environment (add your project's few load-bearing hard rules — the
+  "never touch this production IP" list — near the top).
+- Keep it as a git repo at that path and `spawn-agent` will `git pull` it before each
+  spawn, so edits you make (even from a web UI) reach every new agent automatically.
+- Absent entirely? Spawns proceed without it — never blocked.
+
 ## The webapp + the token key
 
 The default interface is a packaged single-page chat deck served by the gateway on
@@ -185,6 +203,8 @@ schema.sql              the SQLite tables
 registry.example.json   the default two-agent roster (seeded to ~/.tpmem/agent-os/)
 config.example.yaml     OPTIONAL transport-bridge config
 secrets.env.example     OPTIONAL transport credentials
+COLLABORATION.md        the "how to work with the user" guide spawn-agent attaches to
+                        every agent's context (seeded to ~/agentic-collaboration/; COLLAB_DOC)
 install.sh              one-shot setup
 docs/SELF_EXPANSION.md  how to grow past the two default agents
 ```
