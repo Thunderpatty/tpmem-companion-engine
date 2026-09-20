@@ -5,7 +5,7 @@
 --
 -- The engine uses these tables:
 --   entities, notes   — the lightweight knowledge base agents read/write (tpmem)
---   notes_fts         — fts5 index over notes (kb search); triggers feed content + tags
+--   notes_fts         — fts5 index over notes (kb search); CONTENT-ONLY by design (low-noise)
 --   relations         — entity-to-entity graph (kb entity relations / kb context)
 --   handoffs          — session continuity records (kb handoff; backs the wrap system)
 --   messages          — the durable per-channel chat log (the gateway's source of truth)
@@ -65,20 +65,22 @@ CREATE INDEX IF NOT EXISTS idx_notes_category   ON notes(category);
 CREATE INDEX IF NOT EXISTS idx_notes_importance ON notes(importance DESC);
 
 -- ── full-text search over notes (kb search / kb context) ───────────────────
--- fts5 external-content index. The triggers feed BOTH content AND tags so tag
--- tokens are MATCH-searchable immediately — NOT only up to the last 'rebuild'.
--- (Feeding content only is a real defect: `tags:` MATCH and unscoped tag hits
--- silently rot between rebuilds. Found on the fleet 2026-09-20; ship it correct.)
-CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(content, tags, content='notes', content_rowid='id');
+-- fts5 external-content index over CONTENT ONLY — by design. Search matches the
+-- substance of a note, not its labels; tag-only tokens deliberately do NOT match
+-- (tags are for SQL-side scoping, not free-text). This is a low-noise FEATURE, not a
+-- bug: on metered accounts, tag-token hits are noise = cost. Keep it content-only, and
+-- keep exactly ONE trigger set (a second content+tags set double-indexed the fleet
+-- until 2026-09-20 — never add a duplicate notes_fts_insert/delete/update set).
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(content, content='notes', content_rowid='id');
 CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
-    INSERT INTO notes_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
+    INSERT INTO notes_fts(rowid, content) VALUES (new.id, new.content);
 END;
 CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
-    INSERT INTO notes_fts(notes_fts, rowid, content, tags) VALUES('delete', old.id, old.content, old.tags);
+    INSERT INTO notes_fts(notes_fts, rowid, content) VALUES('delete', old.id, old.content);
 END;
 CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
-    INSERT INTO notes_fts(notes_fts, rowid, content, tags) VALUES('delete', old.id, old.content, old.tags);
-    INSERT INTO notes_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
+    INSERT INTO notes_fts(notes_fts, rowid, content) VALUES('delete', old.id, old.content);
+    INSERT INTO notes_fts(rowid, content) VALUES (new.id, new.content);
 END;
 
 -- ── session continuity (kb handoff / kb write-handoff; backs the wrap system) ──
