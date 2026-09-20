@@ -46,6 +46,23 @@ CREATE INDEX IF NOT EXISTS idx_notes_entity     ON notes(entity_id);
 CREATE INDEX IF NOT EXISTS idx_notes_category   ON notes(category);
 CREATE INDEX IF NOT EXISTS idx_notes_importance ON notes(importance DESC);
 
+-- ── full-text search over notes (kb search / kb context) ───────────────────
+-- fts5 external-content index. The triggers feed BOTH content AND tags so tag
+-- tokens are MATCH-searchable immediately — NOT only up to the last 'rebuild'.
+-- (Feeding content only is a real defect: `tags:` MATCH and unscoped tag hits
+-- silently rot between rebuilds. Found on the fleet 2026-09-20; ship it correct.)
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(content, tags, content='notes', content_rowid='id');
+CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
+    INSERT INTO notes_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
+    INSERT INTO notes_fts(notes_fts, rowid, content, tags) VALUES('delete', old.id, old.content, old.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
+    INSERT INTO notes_fts(notes_fts, rowid, content, tags) VALUES('delete', old.id, old.content, old.tags);
+    INSERT INTO notes_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
+END;
+
 -- ── chat channels (durable source of truth for the webapp) ─────────────────
 -- One row per message in a channel. The gateway reads/streams this table; a human
 -- message in an agent's channel is also mirrored into `inbox` so the dispatcher
