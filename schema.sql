@@ -8,7 +8,6 @@
 --   notes_fts         — fts5 index over notes (kb search); triggers feed content + tags
 --   relations         — entity-to-entity graph (kb entity relations / kb context)
 --   handoffs          — session continuity records (kb handoff; backs the wrap system)
---   todos             — lightweight todo list (kb todos; base table, no scheduler)
 --   messages          — the durable per-channel chat log (the gateway's source of truth)
 --   inbox             — pending work routed to an agent (the dispatcher wakes on it)
 --   outbox            — replies queued for an OPTIONAL external transport to deliver
@@ -98,18 +97,10 @@ CREATE TABLE IF NOT EXISTS handoffs (
 CREATE INDEX IF NOT EXISTS idx_handoffs_session_end ON handoffs(session_end DESC);
 CREATE INDEX IF NOT EXISTS idx_handoffs_project     ON handoffs(project_slug);
 
--- ── todos (kb todos — base table only; NOT the lab's reminder-scheduling engine) ──
-CREATE TABLE IF NOT EXISTS todos (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    text        TEXT NOT NULL CHECK (length(trim(text)) > 0),
-    kind        TEXT NOT NULL DEFAULT 'todo',
-    status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','done','canceled')),
-    source      TEXT NOT NULL DEFAULT 'user',
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-    done_at     TEXT,
-    canceled_at TEXT
-);
+-- NOTE: no `todos` table. `kb todos` is intentionally unsupported on a companion box —
+-- the lab's reminder/scheduling subsystem (todo_* satellites + a daemon) is a whole
+-- feature, not a memory table, and a bare stub would look like reminders work when they
+-- don't. Port that deliberately if a box ever needs it.
 
 -- ── chat channels (durable source of truth for the webapp) ─────────────────
 -- One row per message in a channel. The gateway reads/streams this table; a human
