@@ -86,6 +86,21 @@ def save_disp_state(s: dict) -> None:
         pass
 
 
+_LOCAL_CMD_TAGS = ("<local-command-", "<command-name>", "<command-message>",
+                   "<command-args>", "<command-stdout>", "<command-contents>")
+
+
+def _is_local_command(content) -> bool:
+    """A user-role transcript entry that is actually a local slash-command artifact
+    (the /model, /config, /clear … caveat, invocation, and stdout), not a real prompt."""
+    if isinstance(content, str):
+        return any(tag in content for tag in _LOCAL_CMD_TAGS)
+    if isinstance(content, list):
+        return any(isinstance(b, dict) and isinstance(b.get("text"), str)
+                   and any(tag in b["text"] for tag in _LOCAL_CMD_TAGS) for b in content)
+    return False
+
+
 def transcript_state(slug: str, cfg: dict):
     """Ground-truth wakeability from the agent's transcript tail. This is authoritative
     over the hook flag (which can stick 'busy' on a missed Stop hook, or false-stamp busy
@@ -119,7 +134,14 @@ def transcript_state(slug: str, cfg: dict):
             if t == "assistant":
                 return (d.get("message") or {}).get("stop_reason") == "end_turn"
             if t == "user":
-                return False  # a prompt or in-flight tool_result after the last turn → busy
+                # Local slash-command artifacts (/model, /config, …) are written as
+                # user-role entries but are NOT a prompt awaiting a response. Treat them
+                # as noise and keep scanning back for the real last turn — otherwise an
+                # idle session whose last action was a slash command reads as 'busy'
+                # forever and the dispatcher never delivers its pending inbox.
+                if d.get("isMeta") or _is_local_command((d.get("message") or {}).get("content")):
+                    continue
+                return False  # a real prompt or in-flight tool_result after the last turn → busy
         return None
     except Exception:
         return None
