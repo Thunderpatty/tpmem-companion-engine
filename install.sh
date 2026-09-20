@@ -108,6 +108,22 @@ else
   echo "    $CRON_LINE"
 fi
 
+# ── 10. put memory tools on PATH (callable by bare name) ──────────────────────
+# The optional kb / kb-note / agent-recover tools (if a deployment adds them) live
+# outside this repo. Symlink whichever are present into ~/.local/bin so agents can
+# call them by name (`kb entity ...`) instead of by full path — matching their docs.
+# NOTE: this repo does NOT ship those tools; it only wires PATH for them if present.
+say "Wiring memory tools onto PATH (~/.local/bin) if present"
+mkdir -p "$HOME_DIR/.local/bin"
+link_tool() { [ -x "$1" ] && ln -sf "$1" "$HOME_DIR/.local/bin/$(basename "$1")"; }
+link_tool "$TPMEM_DIR/tools/kb"
+link_tool "$TPMEM_DIR/tools/kb-note"
+link_tool "$HOME_DIR/agent-os/bin/agent-recover"
+for rc in "$HOME_DIR/.bashrc" "$HOME_DIR/.profile"; do
+  [ -f "$rc" ] || touch "$rc"
+  grep -q '.local/bin' "$rc" 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
+done
+
 # ── done ─────────────────────────────────────────────────────────────────────
 TOKEN="$(cat "$TOKEN_FILE")"
 cat <<EOF
