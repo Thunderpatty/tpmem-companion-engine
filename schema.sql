@@ -5,6 +5,10 @@
 --
 -- The engine uses these tables:
 --   entities, notes   — the lightweight knowledge base agents read/write (tpmem)
+--   notes_fts         — fts5 index over notes (kb search); triggers feed content + tags
+--   relations         — entity-to-entity graph (kb entity relations / kb context)
+--   handoffs          — session continuity records (kb handoff; backs the wrap system)
+--   todos             — lightweight todo list (kb todos; base table, no scheduler)
 --   messages          — the durable per-channel chat log (the gateway's source of truth)
 --   inbox             — pending work routed to an agent (the dispatcher wakes on it)
 --   outbox            — replies queued for an OPTIONAL external transport to deliver
@@ -25,11 +29,26 @@ CREATE TABLE IF NOT EXISTS entities (
     name        TEXT,
     summary     TEXT,
     status      TEXT DEFAULT 'active',  -- active | pending-review | blocked | done | archived ...
+    status_updated_at DATETIME,         -- when status last changed (kb status)
+    status_notes      TEXT,             -- why status changed (kb status)
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_entities_type   ON entities(type);
 CREATE INDEX IF NOT EXISTS idx_entities_status ON entities(status);
+
+-- entity-to-entity graph (kb entity relations / kb context one-hop)
+CREATE TABLE IF NOT EXISTS relations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_id     INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    to_id       INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    relation    TEXT NOT NULL,          -- works_on | makes | depends_on | part_of | replaces ...
+    context     TEXT,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(from_id, to_id, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_id);
+CREATE INDEX IF NOT EXISTS idx_relations_to   ON relations(to_id);
 
 CREATE TABLE IF NOT EXISTS notes (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +81,35 @@ CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
     INSERT INTO notes_fts(notes_fts, rowid, content, tags) VALUES('delete', old.id, old.content, old.tags);
     INSERT INTO notes_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
 END;
+
+-- ── session continuity (kb handoff / kb write-handoff; backs the wrap system) ──
+CREATE TABLE IF NOT EXISTS handoffs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_end     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    session_start   DATETIME,
+    project_slug    TEXT,
+    completed       TEXT,
+    next_steps      TEXT,
+    open_questions  TEXT,
+    blockers        TEXT,
+    notes           TEXT,
+    acceptance_criteria TEXT              -- if set, kb flips the project to pending-review
+);
+CREATE INDEX IF NOT EXISTS idx_handoffs_session_end ON handoffs(session_end DESC);
+CREATE INDEX IF NOT EXISTS idx_handoffs_project     ON handoffs(project_slug);
+
+-- ── todos (kb todos — base table only; NOT the lab's reminder-scheduling engine) ──
+CREATE TABLE IF NOT EXISTS todos (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    text        TEXT NOT NULL CHECK (length(trim(text)) > 0),
+    kind        TEXT NOT NULL DEFAULT 'todo',
+    status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','done','canceled')),
+    source      TEXT NOT NULL DEFAULT 'user',
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    done_at     TEXT,
+    canceled_at TEXT
+);
 
 -- ── chat channels (durable source of truth for the webapp) ─────────────────
 -- One row per message in a channel. The gateway reads/streams this table; a human
