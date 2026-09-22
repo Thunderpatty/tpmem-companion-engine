@@ -189,6 +189,10 @@ bin/
   context-monitor       watch each agent's token use; trigger a wrap+rotate near the limit
   agent-wrap            author a NEXT.md handoff + KB wrap note (readback-verified)
   rotate-agent          verify a fresh wrap, then respawn the session (continuity)
+  kb                    read the KB: entity / context / decisions / search (content-only FTS)
+  kb-note               the validated KB write path (enum-checked, readback-verified)
+  agent-recover         cold-boot recovery: after an unplanned crash, print missed channel
+                        history + a filtered predecessor-transcript tail
 gateway/
   src/server.ts         HTTP + WebSocket over the bus (token auth, chat, roster, upload)
   public/               the control-deck webapp (index.html, app.js, app.css)

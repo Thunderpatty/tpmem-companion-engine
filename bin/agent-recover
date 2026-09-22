@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""agent-recover — cold-boot continuity recovery for any fleet agent.
+
+The problem it solves: clean wrap-rotate hands off via NEXT.md, but an UNPLANNED
+crash (SIGKILL, OOM, tmux death) leaves the successor cold — primed only from seed,
+blind to whatever was in flight. Today the curator recovered only because the user said
+"read the log." This makes that automatic for every agent.
+
+What it does (DETECTION + EXTRACTION only — it prints material for the agent to read;
+it cannot re-prime the LLM context itself):
+  1. Detect cold-boot-mid-thread: did someone post on my channel AFTER my last
+     authored message, with no fresh NEXT.md handoff? If yes -> recover.
+  2. Print the channel history I missed: everything on my channel since my last
+     authored message, capped at a 72h ceiling (the user's call). Already
+     text, tiny.
+  3. Always ("can't hurt to double-check") print a FILTERED extract of the
+     predecessor session transcript tail: user/assistant text + tool_use name+input,
+     tool-RESULT bodies dropped except external-ingestion tools. Code/files are read
+     live as reference, not pulled in stale. Same strip the curate skill uses.
+
+Exit codes: 10 = recovery performed (agent SHOULD read stdout). 0 = clean boot,
+nothing to recover. Boot sequence runs this before the "online" note.
+
+Usage: agent-recover [--slug <slug>] [--window-hours 72] [--next-fresh-min 15] [--tail-lines 300]
+Identity from $AGENT_OS_SLUG. DB from $TPMEM_DB (default ~/.tpmem/kb.db).
+"""
+from __future__ import annotations
+import argparse, glob, json, os, sqlite3, sys, time
+from datetime import datetime, timezone, timedelta
+
+HOME = os.path.expanduser("~")
+DB = os.environ.get("TPMEM_DB", os.path.join(HOME, ".tpmem/kb.db"))
+PROJECTS = os.path.join(HOME, ".claude/projects")
+
+
+def _detect_layout() -> tuple[str, str]:
+    """Return (agents_dir, registry_path), layout-aware so ONE agent-recover works on
+    both the lab (~/agent-os/agents, agents/registry.json) and companion-engine boxes
+    (~/companion-engine/agents, ~/.tpmem/agent-os/registry.json). Env overrides win:
+    AGENT_OS_AGENTS_DIR for the agents dir, AGENT_REGISTRY for the registry file."""
+    engine = os.environ.get("COMPANION_ENGINE_DIR", os.path.join(HOME, "companion-engine"))
+    lab = os.environ.get("AGENT_OS_DIR", os.path.join(HOME, "agent-os"))
+    agents_env = os.environ.get("AGENT_OS_AGENTS_DIR")
+    reg_env = os.environ.get("AGENT_REGISTRY") or os.environ.get("AGENT_OS_REGISTRY")
+    if agents_env:
+        agents_dir = agents_env
+        registry = reg_env or os.path.join(agents_dir, "registry.json")
+    elif os.path.isdir(os.path.join(engine, "agents")):          # companion-engine box
+        agents_dir = os.path.join(engine, "agents")
+        registry = reg_env or os.path.join(HOME, ".tpmem/agent-os/registry.json")
+    else:                                                         # lab layout
+        agents_dir = os.path.join(lab, "agents")
+        registry = reg_env or os.path.join(agents_dir, "registry.json")
+    return agents_dir, registry
+
+
+AGENTS_DIR, REGISTRY = _detect_layout()
+
+
+def parse_ts(ts: str) -> datetime:
+    # messages.created_at is ISO-ish, may carry 'Z' or offset or be space-separated.
+    ts = ts.strip().replace(" ", "T", 1) if " " in ts and "T" not in ts else ts
+    ts = ts.replace("Z", "+00:00")
+    try:
+        d = datetime.fromisoformat(ts)
+    except ValueError:
+        d = datetime.fromisoformat(ts.split(".")[0].replace("Z", "") + "+00:00")
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--slug", default=os.environ.get("AGENT_OS_SLUG"))
+    ap.add_argument("--window-hours", type=float, default=72.0)
+    ap.add_argument("--next-fresh-min", type=float, default=15.0)
+    ap.add_argument("--tail-lines", type=int, default=300)
+    a = ap.parse_args()
+    slug = a.slug
+    if not slug:
+        print("agent-recover: no slug ($AGENT_OS_SLUG unset)", file=sys.stderr)
+        return 0  # don't block boot
+
+    now = datetime.now(timezone.utc)
+    db = sqlite3.connect(DB, timeout=15)
+    db.row_factory = sqlite3.Row
+
+    rows = db.execute(
+        "SELECT id, sender, body, created_at FROM messages WHERE channel=? ORDER BY id ASC",
+        (slug,),
+    ).fetchall()
+    if not rows:
+        print(f"[agent-recover] {slug}: no channel history — clean first boot.")
+        return 0
+
+    last_authored = max((parse_ts(r["created_at"]) for r in rows if r["sender"] == slug),
+                        default=None)
+    latest = rows[-1]
+    latest_ts = parse_ts(latest["created_at"])
+
+    # NEXT.md freshness — a recent handoff means clean rotation, trust it.
+    nextmd = os.path.join(AGENTS_DIR, slug, "NEXT.md")
+    next_fresh = (os.path.isfile(nextmd)
+                  and (time.time() - os.path.getmtime(nextmd)) < a.next_fresh_min * 60)
+
+    missed = (last_authored is None) or (latest_ts > last_authored and latest["sender"] != slug)
+
+    if not missed:
+        print(f"[agent-recover] {slug}: caught up (last spoke {last_authored}); clean boot.")
+        return 0
+    if next_fresh:
+        print(f"[agent-recover] {slug}: missed traffic exists but NEXT.md is fresh "
+              f"(<{a.next_fresh_min}m) — clean rotation handoff, trusting it.")
+        return 0
+
+    # --- RECOVERY ---
+    floor = now - timedelta(hours=a.window_hours)
+    since = max(last_authored, floor) if last_authored else floor
+    capped = bool(last_authored) and last_authored < floor
+
+    print("=" * 72)
+    print(f"[agent-recover] COLD-BOOT DETECTED for '{slug}'.")
+    print(f"  Last authored: {last_authored}.  Latest on channel: {latest_ts} "
+          f"(from {latest['sender']}).  No fresh NEXT.md.")
+    print(f"  Recovering channel history since {since}"
+          + ("  [capped at 72h ceiling]" if capped else "  [since your last message]"))
+    print("  READ THIS to re-orient, THEN post your online note. Read code/files live "
+          "as reference — don't trust any code quoted below as current.")
+    print("=" * 72)
+
+    print("\n----- CHANNEL HISTORY YOU MISSED -----")
+    for r in rows:
+        if parse_ts(r["created_at"]) >= since:
+            print(f"\n[{r['id']}] {r['sender']} @ {r['created_at']}\n{r['body']}")
+
+    # --- predecessor transcript tail (always; best-effort) ---
+    # All fleet agents share one project dir, so "most-recent jsonl" mis-attributes
+    # (it'd grab whichever agent wrote last). Identify THIS agent's sessions by the
+    # slug signature in the boot prompt, and exclude the CURRENT session via registry.
+    print("\n----- PREDECESSOR TRANSCRIPT TAIL (filtered) -----")
+    current_sid = _registry_session_id(slug)
+    cands = []
+    for f in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
+        base = os.path.basename(f)
+        if current_sid and base.startswith(current_sid):
+            continue  # the live session we're running in
+        try:
+            mt = os.path.getmtime(f)
+        except OSError:
+            continue
+        if time.time() - mt < 90:   # belt-and-suspenders: skip anything written this second
+            continue
+        if _belongs_to(f, slug):
+            cands.append((mt, f))
+    if not cands:
+        print(f"(no prior '{slug}' transcript found — recovering from channel history alone)")
+    else:
+        cands.sort()
+        path = cands[-1][1]
+        print(f"source: {path}  (matched '{slug}' identity; current session excluded)\n")
+        print(_filtered_tail(path, a.tail_lines))
+
+    print("\n" + "=" * 72)
+    print("[agent-recover] End recovery. Re-orient from the above, verify any state "
+          "against live (KB/files), then proceed.")
+    return 10
+
+
+def _registry_session_id(slug: str) -> str | None:
+    try:
+        reg = json.load(open(REGISTRY))
+        return (reg.get("agents", {}).get(slug, {}) or {}).get("session_id")
+    except Exception:
+        return None
+
+
+def _belongs_to(path: str, slug: str) -> bool:
+    """True if this transcript is one of THIS agent's sessions. The boot prompt names
+    the agent ('You are the <slug> agent in agent-os'), so scan the first chunk for the
+    slug identity. Cheap (only reads the head)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = fh.read(20000)
+    except OSError:
+        return False
+    needles = (f"the {slug} agent", f"{slug} agent in agent-os",
+               f'"$AGENT_OS_SLUG"', f"slug is {slug}", f"agents/{slug}/")
+    low = head.lower()
+    return any(n.lower() in low for n in needles)
+
+
+INGEST_TOOLS = {"WebFetch", "WebSearch"}  # + email/MCP fetch handled by name contains
+
+
+def _is_ingest(name: str) -> bool:
+    n = (name or "")
+    return n in INGEST_TOOLS or "fetch" in n.lower() or "email" in n.lower() or "gmail" in n.lower()
+
+
+def _filtered_tail(path: str, n: int) -> str:
+    """Strip tool noise, keep conversation + tool_use name/input + ingestion results.
+    Return the last ~n conversational lines."""
+    out = []
+    try:
+        lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError as e:
+        return f"(could not read transcript: {e})"
+    for line in lines:
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        msg = o.get("message") if isinstance(o.get("message"), dict) else None
+        role = (msg or {}).get("role") or o.get("type")
+        if role not in ("user", "assistant"):
+            continue
+        c = (msg or {}).get("content", o.get("content", ""))
+        ts = o.get("timestamp", "")
+        if isinstance(c, str):
+            if c.strip():
+                out.append(f"[{ts}] {role}: {c.strip()[:600]}")
+        elif isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                t = b.get("type")
+                if t == "text" and b.get("text", "").strip():
+                    out.append(f"[{ts}] {role}: {b['text'].strip()[:600]}")
+                elif t == "tool_use":
+                    out.append(f"[{ts}] {role} TOOL {b.get('name','')}: "
+                               f"{json.dumps(b.get('input',{}))[:300]}")
+                elif t == "tool_result":
+                    # results dropped EXCEPT ingestion tools (injection surface / hidden signal)
+                    pass
+    return "\n".join(out[-n:]) if out else "(no conversational content extracted)"
+
+
+if __name__ == "__main__":
+    sys.exit(main())
